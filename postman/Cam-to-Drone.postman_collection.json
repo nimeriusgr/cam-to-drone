@@ -1,0 +1,31 @@
+{
+  "info": { "name": "Cam to Drone", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+  "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{api_token}}", "type": "string" }] },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080" },
+    { "key": "api_token", "value": "ΒΑΛΤΕ_API_TOKEN_ΑΠΟ_data/credentials.txt" },
+    { "key": "edge_token", "value": "ΒΑΛΤΕ_EDGE_TOKEN" },
+    { "key": "webhook", "value": "/webhook/ΒΑΛΤΕ_ΑΠΟ_ΔΙΑΧΕΙΡΙΣΗ_ΟΡΓΑΝΙΣΜΟΙ" },
+    { "key": "incident_id", "value": "" }
+  ],
+  "item": [
+    { "name": "1. Ping", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"command\":\"ping\"}" }, "url": "{{baseUrl}}/api/command" } },
+    { "name": "2. Δοκιμαστικός συναγερμός (demo)", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"command\":\"demo_alarm\"}" }, "url": "{{baseUrl}}/api/command" } },
+    { "name": "3. Κάμερα Hikvision → webhook επιχείρησης (XML)", "request": { "auth": { "type": "noauth" }, "method": "POST", "header": [{ "key": "Content-Type", "value": "application/xml" }],
+      "body": { "mode": "raw", "raw": "<EventNotificationAlert version=\"2.0\">\n  <ipAddress>192.168.1.64</ipAddress>\n  <channelID>1</channelID>\n  <eventType>linedetection</eventType>\n  <eventState>active</eventState>\n  <targetType>human</targetType>\n</EventNotificationAlert>" },
+      "url": "{{baseUrl}}{{webhook}}" } },
+    { "name": "4. Κουτί → server (όπως στέλνει το edge agent)", "request": { "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{edge_token}}", "type": "string" }] }, "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }],
+      "body": { "mode": "raw", "raw": "{\n  \"camera_key\": \"192.168.1.64:1\",\n  \"camera_name\": \"Είσοδος\",\n  \"type\": \"human\",\n  \"raw_type\": \"fielddetection\",\n  \"target\": \"human\"\n}" }, "url": "{{baseUrl}}/api/edge/event" } },
+    { "name": "5. Λίστα περιστατικών (κρατά το πρώτο ανοιχτό)", "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": [
+        "const o = pm.response.json(); const i = (o.incidents||[]).find(x => x.status !== 'closed');",
+        "if (i) { pm.collectionVariables.set('incident_id', i.id); console.log('incident_id =', i.id); }" ] } }],
+      "request": { "method": "GET", "url": "{{baseUrl}}/api/overview" } },
+    { "name": "6. Ανάληψη", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"command\":\"ack\",\"incident_id\":\"{{incident_id}}\"}" }, "url": "{{baseUrl}}/api/command" } },
+    { "name": "7. Αποστολή drone", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"command\":\"dispatch_drone\",\"incident_id\":\"{{incident_id}}\"}" }, "url": "{{baseUrl}}/api/command" } },
+    { "name": "8. Μεγάφωνο (εκφώνηση)", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"command\":\"speaker\",\"incident_id\":\"{{incident_id}}\",\"text\":\"Προσοχή. Ο χώρος παρακολουθείται.\"}" }, "url": "{{baseUrl}}/api/command" } },
+    { "name": "9. Προβολέας ανοιχτός", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"command\":\"light_on\",\"incident_id\":\"{{incident_id}}\"}" }, "url": "{{baseUrl}}/api/command" } },
+    { "name": "10. Επιστροφή drone", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"command\":\"return_home\",\"incident_id\":\"{{incident_id}}\"}" }, "url": "{{baseUrl}}/api/command" } },
+    { "name": "11. Κλείσιμο", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"command\":\"close\",\"incident_id\":\"{{incident_id}}\",\"outcome\":\"Εισβολή / κλοπή\",\"note\":\"Ενημερώθηκε ο ιδιοκτήτης\"}" }, "url": "{{baseUrl}}/api/command" } },
+    { "name": "12. Ψευδής συναγερμός", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"command\":\"false_alarm\",\"incident_id\":\"{{incident_id}}\",\"note\":\"σκιά\"}" }, "url": "{{baseUrl}}/api/command" } }
+  ]
+}

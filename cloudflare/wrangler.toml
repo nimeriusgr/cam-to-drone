@@ -1,0 +1,11 @@
+name = "cam2drone"
+pages_build_output_dir = "public"
+compatibility_date = "2025-06-01"
+
+[vars]
+SIM_SPEED = "1"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cam2drone"
+database_id = "145220d2-62a0-4d10-935e-a34ffb53a55c"

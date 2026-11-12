@@ -1,0 +1,16 @@
+[Unit]
+Description=Cam to Drone edge agent
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+User=cam2drone
+WorkingDirectory=/opt/cam2drone-edge
+ExecStart=/opt/cam2drone-edge/venv/bin/python /opt/cam2drone-edge/agent.py --config /opt/cam2drone-edge/config.json
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+WatchdogSec=0
+
+[Install]
+WantedBy=multi-user.target

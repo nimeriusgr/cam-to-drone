@@ -1,0 +1,14 @@
+# runtime data and secrets
+data/
+cloudflare/seed.sql
+cloudflare/credentials-cloud.txt
+cloudflare/.seed-tmp/
+cloudflare/public/
+cloudflare/.wrangler/
+cloudflare/node_modules/
+edge/config.json
+edge/spool/
+__pycache__/
+*.pyc
+.DS_Store
+cloudflare/package-lock.json.bak

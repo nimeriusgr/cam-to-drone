@@ -1,0 +1,29 @@
+{
+  "server": "https://kentro.example.gr",
+  "token": "ΒΑΛΤΕ_ΕΔΩ_ΤΟ_TOKEN_ΤΟΥ_ΚΟΥΤΙΟΥ",
+  "verify_tls": true,
+  "heartbeat_seconds": 30,
+  "throttle_seconds": 10,
+  "local_webhook_port": 8090,
+  "cameras": [
+    {
+      "key": "nvr1", "name": "NVR Hikvision", "kind": "hikvision",
+      "host": "192.168.1.100", "port": 80, "user": "edge", "password": "ΚΩΔΙΚΟΣ",
+      "channels": { "1": "Είσοδος", "2": "Parking", "3": "Ράμπα φόρτωσης", "4": "Περίφραξη Β" }
+    },
+    {
+      "key": "cam-avli", "name": "Αυλή", "kind": "dahua",
+      "host": "192.168.1.70", "user": "edge", "password": "ΚΩΔΙΚΟΣ"
+    },
+    {
+      "key": "cam-apothiki", "name": "Αποθήκη", "kind": "onvif",
+      "host": "192.168.1.80", "port": 80, "user": "onvif", "password": "ΚΩΔΙΚΟΣ"
+    },
+    {
+      "key": "cam-pyli", "name": "Πύλη (push)", "kind": "webhook", "match_ip": "192.168.1.90"
+    }
+  ],
+  "gpio": [
+    { "key": "panel-out1", "name": "Έξοδος πίνακα συναγερμού", "pin": 17, "active_low": true }
+  ]
+}
