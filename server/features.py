@@ -397,7 +397,10 @@ def edge_poll(edge):
     cams = live_cams(edge["id"])
     busy = db.q1("SELECT 1 AS x FROM incidents WHERE org_id=? AND status!='closed' LIMIT 1", (edge["org_id"],))
     media = media_cfg()
-    return {"ok": True, "server_time": time.time(), "fast": bool(busy or cams), "live": [c["ext_key"] for c in cams],
+    cmds = take_commands(edge)
+    recent = db.q1("SELECT 1 AS x FROM cam_commands WHERE edge_id=? AND created>? LIMIT 1", (edge["id"], time.time() - 90))
+    return {"ok": True, "server_time": time.time(), "fast": bool(busy or cams or cmds or recent), "live": [c["ext_key"] for c in cams],
+            "commands": cmds,
             # with a media server: the box streams video+audio there instead of sending snapshots
             "streams": {c["ext_key"]: media_url(media["publish"], media_path("cam", c["id"])) for c in cams} if media.get("publish") else {},
             "update": bool(edge.get("update_requested")), "agent": agent_info(meta_only=True)}
@@ -466,3 +469,130 @@ def agent_info(meta_only=False):
 
 def version_tuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", v or "0")[:3])
+
+
+# ================================================================== camera control: arming per camera and ONVIF commands through the box
+ARMING = {"inherit": "Όπως η επιχείρηση", "armed": "Οπλισμένη", "disarmed": "Αφοπλισμένη"}
+# command -> (label, capability it needs, roles allowed)
+CAM_CMDS = {
+    "ptz_move": ("Κίνηση κάμερας", "ptz", STAFF), "ptz_stop": ("Διακοπή κίνησης", "ptz", STAFF),
+    "ptz_home": ("Αρχική θέση", "ptz", STAFF), "ptz_preset": ("Μετάβαση σε θέση", "ptz", STAFF),
+    "ptz_set_preset": ("Αποθήκευση θέσης", "ptz", STAFF), "relay": ("Έξοδος κάμερας", "relays", STAFF),
+    "ircut": ("Λειτουργία ημέρας/νύχτας", "ircut", STAFF), "reboot": ("Επανεκκίνηση κάμερας", "onvif", ("admin", "supervisor")),
+    "caps": ("Ανάγνωση δυνατοτήτων", None, STAFF),
+}
+COMMAND_TTL = 60  # a command the box has not picked up in 60 s is dropped (the situation has changed by then)
+
+
+def caps_of(cam):
+    try:
+        return json.loads(cam.get("caps") or "{}") or {}
+    except ValueError:
+        return {}
+
+
+def validate_command(cam, user, cmd, args):
+    """Returns cleaned args or raises ValueError (same rules as validateCommand in cloudflare/lib/app.js)."""
+    if cmd not in CAM_CMDS:
+        raise ValueError("Άγνωστη εντολή κάμερας")
+    label, need_cap, roles = CAM_CMDS[cmd]
+    if user["role"] not in roles:
+        raise PermissionError("Δεν έχετε δικαίωμα για αυτή την εντολή")
+    caps = caps_of(cam)
+    if need_cap and not caps.get(need_cap):
+        raise ValueError("Η κάμερα δεν υποστηρίζει αυτή τη λειτουργία (ή δεν έχει αναφερθεί ακόμα από το κουτί)")
+    a = {}
+    if cmd == "ptz_move":
+        f = lambda k: max(-1.0, min(1.0, float(args.get(k) or 0)))  # noqa: E731
+        a = {"pan": f("pan"), "tilt": f("tilt"), "zoom": f("zoom"), "seconds": max(0.2, min(3.0, float(args.get("seconds") or 0.6)))}
+    elif cmd == "ptz_preset":
+        if str(args.get("token")) not in [str(p.get("token")) for p in caps.get("presets", [])]:
+            raise ValueError("Άγνωστη θέση")
+        a = {"token": str(args["token"])}
+    elif cmd == "ptz_set_preset":
+        name = str(args.get("name") or "").strip()[:40]
+        if not name:
+            raise ValueError("Δώστε όνομα θέσης")
+        a = {"name": name}
+    elif cmd == "relay":
+        if str(args.get("token")) not in [str(r.get("token")) for r in caps.get("relays", [])]:
+            raise ValueError("Άγνωστη έξοδος")
+        a = {"token": str(args["token"]), "state": "active" if args.get("state") == "active" else "inactive"}
+    elif cmd == "ircut":
+        if args.get("mode") not in ("ON", "OFF", "AUTO"):
+            raise ValueError("Λειτουργία ημέρας/νύχτας: ON, OFF ή AUTO")
+        a = {"mode": args["mode"]}
+    if args.get("incident_id"):
+        a["incident_id"] = int(args["incident_id"])
+    return a
+
+
+def queue_command(cam, user, cmd, args):
+    a = validate_command(cam, user, cmd, args or {})
+    cid = db.insert("cam_commands", {"camera_id": cam["id"], "edge_id": cam["edge_id"], "cmd": cmd, "args": a, "who": user["name"], "created": time.time()})
+    if cmd not in ("ptz_move", "ptz_stop", "caps"):
+        logic.audit(user["name"], f"camera.{cmd}", f"{cam['name']} " + json.dumps({k: v for k, v in a.items() if k != "incident_id"}, ensure_ascii=False))
+        if a.get("incident_id"):
+            logic.add_timeline(a["incident_id"], f"Κάμερα «{cam['name']}»: {command_text(cmd, a, cam)}", user["name"], "camera")
+    return cid
+
+
+def command_text(cmd, a, cam=None):
+    caps = caps_of(cam or {})
+    if cmd == "relay":
+        name = next((r.get("name") for r in caps.get("relays", []) if str(r.get("token")) == a.get("token")), a.get("token"))
+        return f"έξοδος {name} {'ενεργή' if a.get('state') == 'active' else 'ανενεργή'}"
+    if cmd == "ircut":
+        return {"ON": "λειτουργία ημέρας", "OFF": "λειτουργία νύχτας", "AUTO": "αυτόματη ημέρα/νύχτα"}[a["mode"]]
+    if cmd == "ptz_preset":
+        return "θέση " + next((p.get("name") for p in caps.get("presets", []) if str(p.get("token")) == a.get("token")), a.get("token"))
+    if cmd == "ptz_set_preset":
+        return f"αποθήκευση θέσης «{a['name']}»"
+    return CAM_CMDS[cmd][0].lower()
+
+
+def take_commands(edge):
+    """Commands waiting for this box: they leave the queue once (status sent)."""
+    now = time.time()
+    db.ex("UPDATE cam_commands SET status='expired', done_ts=? WHERE status='pending' AND created<?", (now, now - COMMAND_TTL))
+    rows = db.q("SELECT q.id, q.cmd, q.args, c.ext_key AS camera_key FROM cam_commands q JOIN cameras c ON c.id=q.camera_id "
+                "WHERE q.edge_id=? AND q.status='pending' ORDER BY q.id LIMIT 20", (edge["id"],))
+    for r in rows:
+        db.ex("UPDATE cam_commands SET status='sent', sent_ts=? WHERE id=? AND status='pending'", (now, r["id"]))
+    return [{"id": r["id"], "cmd": r["cmd"], "args": r["args"], "camera_key": r["camera_key"]} for r in rows]
+
+
+def command_result(edge, body):
+    q = db.q1("SELECT * FROM cam_commands WHERE id=? AND edge_id=?", (int(body.get("id") or 0), edge["id"]))
+    if not q:
+        return None
+    ok = bool(body.get("ok"))
+    res = body.get("result") if ok else {"error": str(body.get("error") or "αποτυχία")[:300]}
+    db.update("cam_commands", q["id"], {"status": "done" if ok else "failed", "result": json.dumps(res, ensure_ascii=False)[:8000], "done_ts": time.time()})
+    if ok and isinstance(res, dict) and isinstance(res.get("caps"), dict):
+        db.update("cameras", q["camera_id"], {"caps": json.dumps(res["caps"], ensure_ascii=False)[:8000]})
+    if not ok and (q["args"] or {}).get("incident_id"):
+        cam = db.q1("SELECT name FROM cameras WHERE id=?", (q["camera_id"],))
+        logic.add_timeline(q["args"]["incident_id"], f"Κάμερα «{cam['name']}»: η εντολή απέτυχε ({res['error']})", "σύστημα", "camera")
+    return {"ok": True}
+
+
+def command_view(cid):
+    q = db.q1("SELECT id, cmd, status, result, created, done_ts FROM cam_commands WHERE id=?", (cid,))
+    if q and q.get("result"):
+        try:
+            q["result"] = json.loads(q["result"])
+        except ValueError:
+            pass
+    return q
+
+
+def camera_control(cam):
+    edge = db.q1("SELECT last_seen, version FROM edges WHERE id=?", (cam["edge_id"],)) if cam.get("edge_id") else None
+    org = db.q1("SELECT * FROM orgs WHERE id=?", (cam["org_id"],))
+    return {"id": cam["id"], "name": cam["name"], "org_id": cam["org_id"], "org_name": org["name"] if org else "",
+            "arming_mode": cam.get("arming_mode") or "inherit", "org_armed": logic.is_armed(org) if org else None,
+            "armed_now": cam.get("arming_mode") == "armed" or (cam.get("arming_mode") != "disarmed" and bool(org and logic.is_armed(org))),
+            "enabled": cam["enabled"], "online": cam["online"], "caps": caps_of(cam),
+            "edge": {"online": bool(edge and edge["last_seen"] and time.time() - edge["last_seen"] < 120), "version": edge["version"]} if edge else None,
+            "recent": [command_view(r["id"]) for r in db.q("SELECT id FROM cam_commands WHERE camera_id=? ORDER BY id DESC LIMIT 8", (cam["id"],))]}

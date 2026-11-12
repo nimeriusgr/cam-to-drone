@@ -66,6 +66,10 @@ CREATE TABLE IF NOT EXISTS nofly(
   level TEXT DEFAULT 'block', notes TEXT DEFAULT '', enabled INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS push_subs(
   id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, endpoint TEXT UNIQUE NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, ts REAL);
+CREATE TABLE IF NOT EXISTS cam_commands(
+  id INTEGER PRIMARY KEY, camera_id INTEGER NOT NULL, edge_id INTEGER NOT NULL, cmd TEXT NOT NULL, args TEXT DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending', result TEXT, who TEXT, created REAL NOT NULL, sent_ts REAL, done_ts REAL);
+CREATE INDEX IF NOT EXISTS ix_cmd_edge ON cam_commands(edge_id, status);
 CREATE INDEX IF NOT EXISTS ix_inc_status ON incidents(status, last_ts);
 CREATE INDEX IF NOT EXISTS ix_inc_first ON incidents(first_ts);
 CREATE INDEX IF NOT EXISTS ix_ev_ts ON events(ts);
@@ -75,9 +79,10 @@ CREATE INDEX IF NOT EXISTS ix_shift_open ON shifts(end_ts);
 """
 
 # columns added after v1.0 (existing databases get them with ALTER TABLE)
-COLUMNS = [("missions", "onsite_ts", "REAL"), ("events", "clip", "TEXT"), ("edges", "update_requested", "INTEGER DEFAULT 0")]
+COLUMNS = [("missions", "onsite_ts", "REAL"), ("events", "clip", "TEXT"), ("edges", "update_requested", "INTEGER DEFAULT 0"),
+           ("cameras", "arming_mode", "TEXT DEFAULT 'inherit'"), ("cameras", "caps", "TEXT")]
 
-JSON_COLS = {"schedule", "allowed_types", "sop", "cameras", "sop_done", "speaker_presets"}
+JSON_COLS = {"schedule", "allowed_types", "sop", "cameras", "sop_done", "speaker_presets", "args"}
 
 
 def conn():

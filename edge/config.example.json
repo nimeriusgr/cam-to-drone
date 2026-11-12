@@ -15,11 +15,12 @@
     },
     {
       "key": "cam-avli", "name": "Αυλή", "kind": "dahua",
-      "host": "192.168.1.70", "user": "edge", "password": "ΚΩΔΙΚΟΣ"
+      "host": "192.168.1.70", "user": "edge", "password": "ΚΩΔΙΚΟΣ", "onvif": true
     },
     {
       "key": "cam-apothiki", "name": "Αποθήκη", "kind": "onvif",
-      "host": "192.168.1.80", "port": 80, "user": "onvif", "password": "ΚΩΔΙΚΟΣ"
+      "host": "192.168.1.80", "port": 80, "user": "onvif", "password": "ΚΩΔΙΚΟΣ",
+      "relay_names": { "AlarmOut_0": "Σειρήνα" }
     },
     {
       "key": "cam-pyli", "name": "Πύλη (push)", "kind": "webhook", "match_ip": "192.168.1.90",

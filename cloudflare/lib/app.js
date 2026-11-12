@@ -8,7 +8,7 @@ const MERGE_SECONDS = 120;
 const CAMERA_OFFLINE_AFTER = 120;
 const CRUISE_MS = 15, TAKEOFF_S = 20;
 const MAX_MEDIA = 1_400_000;
-const JSON_COLS = new Set(['schedule', 'allowed_types', 'sop', 'cameras', 'sop_done', 'speaker_presets']);
+const JSON_COLS = new Set(['schedule', 'allowed_types', 'sop', 'cameras', 'sop_done', 'speaker_presets', 'args']);
 
 const TYPES = {
   human: ['Άτομο', 1], vehicle: ['Όχημα', 1], input: ['Είσοδος συναγερμού', 1], zone: ['Είσοδος σε ζώνη', 2],
@@ -29,7 +29,7 @@ const ADMIN = {
   orgs: ['parent_id', 'kind', 'name', 'address', 'lat', 'lon', 'notes', 'arming_mode', 'schedule', 'allowed_types', 'sop', 'ack_timeout', 'speaker_presets'],
   contacts: ['org_id', 'name', 'role', 'phone', 'email', 'priority', 'notify_sms', 'notify_email'],
   edges: ['org_id', 'name'],
-  cameras: ['org_id', 'edge_id', 'ext_key', 'name', 'lat', 'lon', 'enabled', 'snooze_until'],
+  cameras: ['org_id', 'edge_id', 'ext_key', 'name', 'lat', 'lon', 'enabled', 'snooze_until', 'arming_mode'],
   docks: ['name', 'lat', 'lon', 'radius_km', 'adapter', 'serial', 'has_speaker', 'has_light', 'enabled'],
   users: ['username', 'name', 'role', 'org_id', 'active'],
   nofly: ['name', 'lat', 'lon', 'radius_m', 'level', 'notes', 'enabled'],
@@ -43,6 +43,14 @@ const WEATHER_CODES = { 0: 'Αίθριος', 1: 'Κυρίως αίθριος', 2
   71: 'Χιόνι', 73: 'Χιόνι', 75: 'Πυκνό χιόνι', 77: 'Χιονόκοκκοι', 80: 'Μπόρες', 81: 'Μπόρες', 82: 'Ισχυρές μπόρες', 85: 'Χιονοπτώσεις', 86: 'Χιονοπτώσεις',
   95: 'Καταιγίδα', 96: 'Καταιγίδα με χαλάζι', 99: 'Καταιγίδα με χαλάζι' };
 const LIVE_SECONDS = 30;
+const ARMING = { inherit: 'Όπως η επιχείρηση', armed: 'Οπλισμένη', disarmed: 'Αφοπλισμένη' };
+// command -> [label, capability it needs, roles allowed]
+const CAM_CMDS = {
+  ptz_move: ['Κίνηση κάμερας', 'ptz', STAFF], ptz_stop: ['Διακοπή κίνησης', 'ptz', STAFF], ptz_home: ['Αρχική θέση', 'ptz', STAFF],
+  ptz_preset: ['Μετάβαση σε θέση', 'ptz', STAFF], ptz_set_preset: ['Αποθήκευση θέσης', 'ptz', STAFF], relay: ['Έξοδος κάμερας', 'relays', STAFF],
+  ircut: ['Λειτουργία ημέρας/νύχτας', 'ircut', STAFF], reboot: ['Επανεκκίνηση κάμερας', 'onvif', ['admin', 'supervisor']], caps: ['Ανάγνωση δυνατοτήτων', null, STAFF],
+};
+const COMMAND_TTL = 60;
 const wxCache = new Map(); // per isolate, 10 minutes
 const PHASES = { enroute: 'Το drone απογειώθηκε, σε πορεία', onsite: 'Το drone έφτασε στο σημείο', landed: 'Το drone προσγειώθηκε στο Dock' };
 const COMMANDS = { ack: 'ack', dispatch_drone: 'dispatch', return_home: 'return_home', false_alarm: 'false_alarm', close: 'close',
@@ -267,7 +275,8 @@ class App {
     if (['inactive', 'stop', 'false', '0'].includes(st)) reason = 'τέλος συμβάντος';
     else if (!cam.enabled) reason = 'κάμερα απενεργοποιημένη';
     else if (cam.snooze_until && cam.snooze_until > t) reason = 'κάμερα σε παύση';
-    else if (!TECHNICAL.has(etype) && etype !== 'tamper' && !ignoreArming && !isArmed(org)) reason = 'αφόπλιστο (εκτός ωραρίου)';
+    else if (!TECHNICAL.has(etype) && etype !== 'tamper' && !ignoreArming && cam.arming_mode === 'disarmed') reason = 'κάμερα αφοπλισμένη';
+    else if (!TECHNICAL.has(etype) && etype !== 'tamper' && !ignoreArming && cam.arming_mode !== 'armed' && !isArmed(org)) reason = 'αφόπλιστο (εκτός ωραρίου)';
     else if (org.allowed_types.length && !org.allowed_types.includes(etype) && !TECHNICAL.has(etype)) reason = 'τύπος φιλτραρισμένος';
     if (reason) { const eid = await this.db.insert('events', { ...ev, suppressed: reason }); return { ok: true, suppressed: reason, event_id: eid }; }
 
@@ -514,7 +523,10 @@ class App {
     const media = await this.mediaCfg(), streams = {};
     // with a media server: the box streams video+audio there instead of sending snapshots
     if (media.publish) for (const c of cams) streams[c.ext_key] = media.publish.split('{path}').join(await this.mediaPath('cam', c.id));
-    return { ok: true, server_time: t, fast: !!(busy || cams.length), live: cams.map(c => c.ext_key), streams, update: !!edge.update_requested, agent: { version: AGENT.version, sha256: AGENT.sha256 } };
+    const commands = await this.takeCommands(edge);
+    const recent = await this.db.q1('SELECT 1 AS x FROM cam_commands WHERE edge_id=? AND created>? LIMIT 1', [edge.id, t - 90]);
+    return { ok: true, server_time: t, fast: !!(busy || cams.length || commands.length || recent), live: cams.map(c => c.ext_key), streams, commands,
+      update: !!edge.update_requested, agent: { version: AGENT.version, sha256: AGENT.sha256 } };
   }
   // live video + audio through a media server (same scheme as server/features.py)
   async mediaCfg() { return await this.db.setting('media', {}) || {}; }
@@ -532,6 +544,69 @@ class App {
     await this.db.update('events', ev.id, { clip: name });
     await this.tl(ev.incident_id, `Κλιπ βίντεο συναγερμού · ${cam.name}`, 'σύστημα', 'clip');
     return { ok: true, incident_id: ev.incident_id, clip: name };
+  }
+
+  // ---------------- camera control (same rules as server/features.py)
+  capsOf(cam) { try { const c = JSON.parse(cam.caps || '{}'); return c && typeof c === 'object' && !Array.isArray(c) ? c : {}; } catch { return {}; } }
+  validateCommand(cam, u, cmd, args) {
+    const spec = CAM_CMDS[cmd]; need(spec, 400, 'Άγνωστη εντολή κάμερας');
+    need(spec[2].includes(u.role), 403, 'Δεν έχετε δικαίωμα για αυτή την εντολή');
+    const caps = this.capsOf(cam);
+    need(!spec[1] || caps[spec[1]], 400, 'Η κάμερα δεν υποστηρίζει αυτή τη λειτουργία (ή δεν έχει αναφερθεί ακόμα από το κουτί)');
+    let a = {}; const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || 0));
+    if (cmd === 'ptz_move') a = { pan: clamp(args.pan, -1, 1), tilt: clamp(args.tilt, -1, 1), zoom: clamp(args.zoom, -1, 1), seconds: clamp(args.seconds || 0.6, 0.2, 3) };
+    else if (cmd === 'ptz_preset') { need((caps.presets || []).some(x => String(x.token) === String(args.token)), 400, 'Άγνωστη θέση'); a = { token: String(args.token) }; }
+    else if (cmd === 'ptz_set_preset') { const n = String(args.name || '').trim().slice(0, 40); need(n, 400, 'Δώστε όνομα θέσης'); a = { name: n }; }
+    else if (cmd === 'relay') { need((caps.relays || []).some(x => String(x.token) === String(args.token)), 400, 'Άγνωστη έξοδος'); a = { token: String(args.token), state: args.state === 'active' ? 'active' : 'inactive' }; }
+    else if (cmd === 'ircut') { need(['ON', 'OFF', 'AUTO'].includes(args.mode), 400, 'Λειτουργία ημέρας/νύχτας: ON, OFF ή AUTO'); a = { mode: args.mode }; }
+    if (args.incident_id) a.incident_id = +args.incident_id;
+    return a;
+  }
+  commandText(cmd, a, cam) {
+    const caps = this.capsOf(cam || {});
+    if (cmd === 'relay') { const r = (caps.relays || []).find(x => String(x.token) === a.token); return `έξοδος ${r && r.name || a.token} ${a.state === 'active' ? 'ενεργή' : 'ανενεργή'}`; }
+    if (cmd === 'ircut') return { ON: 'λειτουργία ημέρας', OFF: 'λειτουργία νύχτας', AUTO: 'αυτόματη ημέρα/νύχτα' }[a.mode];
+    if (cmd === 'ptz_preset') { const x = (caps.presets || []).find(y => String(y.token) === a.token); return 'θέση ' + (x && x.name || a.token); }
+    if (cmd === 'ptz_set_preset') return `αποθήκευση θέσης «${a.name}»`;
+    return CAM_CMDS[cmd][0].toLowerCase();
+  }
+  async queueCommand(cam, u, cmd, args) {
+    const a = this.validateCommand(cam, u, cmd, args);
+    const id = await this.db.insert('cam_commands', { camera_id: cam.id, edge_id: cam.edge_id, cmd, args: a, who: u.name, created: now() });
+    if (!['ptz_move', 'ptz_stop', 'caps'].includes(cmd)) {
+      const { incident_id, ...rest } = a;
+      await this.audit(u.name, `camera.${cmd}`, `${cam.name} ${JSON.stringify(rest)}`);
+      if (incident_id) await this.tl(incident_id, `Κάμερα «${cam.name}»: ${this.commandText(cmd, a, cam)}`, u.name, 'camera');
+    }
+    return id;
+  }
+  async takeCommands(edge) {
+    const t = now();
+    await this.db.ex("UPDATE cam_commands SET status='expired', done_ts=? WHERE status='pending' AND created<?", [t, t - COMMAND_TTL]);
+    const rows = await this.db.q("SELECT q.id, q.cmd, q.args, c.ext_key AS camera_key FROM cam_commands q JOIN cameras c ON c.id=q.camera_id WHERE q.edge_id=? AND q.status='pending' ORDER BY q.id LIMIT 20", [edge.id]);
+    for (const r of rows) await this.db.ex("UPDATE cam_commands SET status='sent', sent_ts=? WHERE id=? AND status='pending'", [t, r.id]);
+    return rows.map(r => ({ id: r.id, cmd: r.cmd, args: r.args, camera_key: r.camera_key }));
+  }
+  async commandResult(edge, b) {
+    const q = await this.db.q1('SELECT * FROM cam_commands WHERE id=? AND edge_id=?', [+b.id || 0, edge.id]); if (!q) return null;
+    const ok = !!b.ok, res = ok ? (b.result ?? null) : { error: String(b.error || 'αποτυχία').slice(0, 300) };
+    await this.db.update('cam_commands', q.id, { status: ok ? 'done' : 'failed', result: JSON.stringify(res).slice(0, 8000), done_ts: now() });
+    if (ok && res && res.caps && typeof res.caps === 'object') await this.db.update('cameras', q.camera_id, { caps: JSON.stringify(res.caps).slice(0, 8000) });
+    if (!ok && q.args && q.args.incident_id) { const c = await this.db.q1('SELECT name FROM cameras WHERE id=?', [q.camera_id]); await this.tl(q.args.incident_id, `Κάμερα «${c.name}»: η εντολή απέτυχε (${res.error})`, 'σύστημα', 'camera'); }
+    return { ok: true };
+  }
+  async commandView(id) {
+    const q = await this.db.q1('SELECT id, cmd, status, result, created, done_ts FROM cam_commands WHERE id=?', [id]);
+    if (q && q.result) { try { q.result = JSON.parse(q.result); } catch { } }
+    return q;
+  }
+  async cameraControl(cam) {
+    const edge = cam.edge_id ? await this.db.q1('SELECT last_seen, version FROM edges WHERE id=?', [cam.edge_id]) : null;
+    const org = await this.db.q1('SELECT * FROM orgs WHERE id=?', [cam.org_id]), orgArmed = org ? isArmed(org) : null, mode = cam.arming_mode || 'inherit';
+    const recent = []; for (const r of await this.db.q('SELECT id FROM cam_commands WHERE camera_id=? ORDER BY id DESC LIMIT 8', [cam.id])) recent.push(await this.commandView(r.id));
+    return { id: cam.id, name: cam.name, org_id: cam.org_id, org_name: org ? org.name : '', arming_mode: mode, org_armed: orgArmed,
+      armed_now: mode === 'armed' || (mode !== 'disarmed' && !!orgArmed), enabled: cam.enabled, online: cam.online, caps: this.capsOf(cam),
+      edge: edge ? { online: !!(edge.last_seen && now() - edge.last_seen < 120), version: edge.version } : null, recent };
   }
 
   // ---------------- statistics
@@ -795,6 +870,24 @@ class App {
       }
       return json({ ok: true, enabled: true, devices: (await this.db.q1('SELECT COUNT(*) AS n FROM push_subs WHERE user_id=?', [u.id])).n });
     }
+    // camera control: arming per camera, ONVIF commands through the box
+    if ((m = p.match(/^\/api\/cameras\/(\d+)\/(control|arming|command)$/))) {
+      const u = await this.user(true, STAFF);
+      const cam = await this.db.q1('SELECT * FROM cameras WHERE id=?', [+m[1]]); need(cam, 404, 'Δεν βρέθηκε');
+      if (m[2] === 'control') return json(await this.cameraControl(cam));
+      need(method === 'POST', 405, 'Μη επιτρεπτή μέθοδος');
+      const b = await this.body();
+      if (m[2] === 'arming') {
+        need(ARMING[b.mode], 400, 'Οπλισμός: inherit, armed ή disarmed');
+        await this.db.update('cameras', cam.id, { arming_mode: b.mode });
+        await this.audit(u.name, 'camera.arming', `${cam.name}: ${ARMING[b.mode]}`);
+        if (b.incident_id) await this.tl(+b.incident_id, `Κάμερα «${cam.name}»: ${ARMING[b.mode].toLowerCase()}`, u.name, 'camera');
+        return json(await this.cameraControl(await this.db.q1('SELECT * FROM cameras WHERE id=?', [cam.id])));
+      }
+      need(cam.edge_id, 409, 'Η κάμερα δεν συνδέεται μέσω κουτιού, άρα δεν δέχεται εντολές');
+      return json({ ok: true, id: await this.queueCommand(cam, u, b.cmd, b.args || {}) });
+    }
+    if ((m = p.match(/^\/api\/commands\/(\d+)$/))) { await this.user(true, STAFF); const q = await this.commandView(+m[1]); need(q, 404, 'Δεν βρέθηκε'); return json(q); }
     // near-live camera image (through the edge box)
     if ((m = p.match(/^\/api\/cameras\/(\d+)\/(live|frame)$/))) {
       const u = await this.user(), vis = await this.visible(u);
@@ -865,6 +958,7 @@ class App {
     }
     if (p === '/api/edge/poll') return json(await this.edgePoll(edge));
     const b = await this.body();
+    if (p === '/api/edge/command') { const r = await this.commandResult(edge, b); need(r, 404, 'Άγνωστη εντολή'); return json(r); }
     if (p === '/api/edge/event') {
       need(b.camera_key, 400, 'Λείπει camera_key');
       return json(await this.ingest({ orgId: edge.org_id, key: b.camera_key, rawType: b.type || b.raw_type, target: b.target, state: b.state || 'active',
@@ -874,7 +968,9 @@ class App {
       await this.db.update('edges', edge.id, { version: b.version || '' });
       for (const c of b.cameras || []) {
         const cam = await this.camera(edge.org_id, c.key, c.name, edge.id);
-        await this.db.update('cameras', cam.id, { last_seen: now(), online: c.online === false ? 0 : 1, edge_id: edge.id });
+        const upd = { last_seen: now(), online: c.online === false ? 0 : 1, edge_id: edge.id };
+        if (c.caps && typeof c.caps === 'object' && !Array.isArray(c.caps)) upd.caps = JSON.stringify(c.caps).slice(0, 8000); // ONVIF capabilities
+        await this.db.update('cameras', cam.id, upd);
       }
       if (edge.update_requested && b.version === AGENT.version) { await this.db.update('edges', edge.id, { update_requested: 0 }); edge.update_requested = 0; }
       return json(await this.edgePoll(edge));

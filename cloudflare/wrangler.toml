@@ -14,3 +14,17 @@ database_id = "145220d2-62a0-4d10-935e-a34ffb53a55c"
 [[r2_buckets]]
 binding = "MEDIA"
 bucket_name = "cam2drone-media"
+
+# Pilot: deploys with --branch pilot (https://pilot.cam2drone.pages.dev) use their own database and storage,
+# so new versions can be tried without touching the live data.
+[env.preview]
+vars = { SIM_SPEED = "1" }
+
+[[env.preview.d1_databases]]
+binding = "DB"
+database_name = "cam2drone-pilot"
+database_id = "c38d1b7f-528e-4703-9eb8-eeb13211bd4e"
+
+[[env.preview.r2_buckets]]
+binding = "MEDIA"
+bucket_name = "cam2drone-pilot-media"

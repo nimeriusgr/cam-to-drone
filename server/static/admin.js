@@ -44,10 +44,13 @@
       title: 'Κάμερες', table: 'cameras', add: 'Νέα κάμερα',
       cols: [['Επιχείρηση', r => esc(orgName(r.org_id))], ['Κάμερα', r => `<b>${esc(r.name)}</b><div class="mut"><code>${esc(r.ext_key)}</code></div>`],
         ['Κατάσταση', r => `<span class="dot ${!r.enabled ? 'grey' : r.online ? '' : 'red'}" style="display:inline-block"></span> ${!r.enabled ? 'απενεργοποιημένη' : r.online ? 'online' : 'εκτός σύνδεσης'}${r.snooze_until > Date.now() / 1000 ? `<div class="mut">σε παύση έως ${fmtTs(r.snooze_until)}</div>` : ''}`],
-        ['Τελευταίο σήμα', r => ago(r.last_seen)], ['Θέση', r => r.lat != null ? `${(+r.lat).toFixed(5)}, ${(+r.lon).toFixed(5)}` : '—']],
+        ['Οπλισμός', r => ({ armed: '<span class="pill ack">Οπλισμένη</span>', disarmed: '<span class="pill">Αφοπλισμένη</span>' })[r.arming_mode] || '<span class="mut">όπως η επιχείρηση</span>'],
+        ['Τελευταίο σήμα', r => ago(r.last_seen)], ['Θέση', r => r.lat != null ? `${(+r.lat).toFixed(5)}, ${(+r.lon).toFixed(5)}` : '—'],
+        ['', r => `<button class="btn sm" data-camctl="${r.id}">Έλεγχος ⚙</button>`]],
       fields: () => [['org_id', 'Επιχείρηση', 'select', { options: orgOptions(false), required: true }], ['edge_id', 'Κουτί', 'select', { options: edgeOptions() }],
         ['name', 'Όνομα', 'text', { required: true }], ['ext_key', 'Κλειδί κάμερας (όπως το στέλνει το κουτί, π.χ. 192.168.1.64:1)', 'text', { required: true }],
-        ['lat', 'Γεωγρ. πλάτος', 'number'], ['lon', 'Γεωγρ. μήκος', 'number'], ['enabled', 'Ενεργή', 'check'], ['snooze_until', 'Παύση έως (κενό = χωρίς παύση)', 'clearsnooze']],
+        ['lat', 'Γεωγρ. πλάτος', 'number'], ['lon', 'Γεωγρ. μήκος', 'number'], ['enabled', 'Ενεργή', 'check'], ['arming_mode', 'Οπλισμός κάμερας', 'select', { options: { inherit: 'Όπως η επιχείρηση', armed: 'Πάντα οπλισμένη', disarmed: 'Αφοπλισμένη' } }],
+        ['snooze_until', 'Παύση έως (κενό = χωρίς παύση)', 'clearsnooze']],
     },
     edges: {
       title: 'Κουτιά (Raspberry / Linux)', table: 'edges', add: 'Νέο κουτί',
@@ -120,6 +123,7 @@
         <table><thead><tr>${p.cols.map(c => `<th>${c[0]}</th>`).join('')}${ro ? '' : '<th></th>'}</tr></thead>
         <tbody>${rows.map(r => `<tr>${p.cols.map(c => `<td>${c[1](r)}</td>`).join('')}${ro ? '' : `<td style="white-space:nowrap"><button class="btn sm" data-edit="${r.id}">Επεξεργασία</button> <button class="btn sm" data-del="${r.id}">Διαγραφή</button></td>`}</tr>`).join('')
         || `<tr><td colspan="9" class="mut">Δεν υπάρχουν εγγραφές.</td></tr>`}</tbody></table>`;
+      $$('[data-camctl]', body).forEach(b => b.onclick = () => Features.openCamera(+b.dataset.camctl));
       if (ro) return;
       $('#aAdd').onclick = () => form(p, null);
       $$('[data-edit]', body).forEach(b => b.onclick = () => form(p, rows.find(r => r.id === +b.dataset.edit)));

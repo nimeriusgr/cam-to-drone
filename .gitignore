@@ -14,3 +14,4 @@ __pycache__/
 cloudflare/package-lock.json.bak
 cloudflare/lib/edge_agent.js
 .wrangler/
+cloudflare/credentials-pilot.txt

@@ -315,5 +315,89 @@
     };
   }
 
+  /* ================================================================ camera control panel: arming + ONVIF commands */
+  const ARM = { inherit: 'Όπως η επιχείρηση', armed: 'Οπλισμένη', disarmed: 'Αφοπλισμένη' };
+  const CMD_LABEL = { ptz_move: 'Κίνηση', ptz_stop: 'Διακοπή', ptz_home: 'Αρχική θέση', ptz_preset: 'Θέση', ptz_set_preset: 'Αποθήκευση θέσης', relay: 'Έξοδος', ircut: 'Ημέρα/νύχτα', reboot: 'Επανεκκίνηση', caps: 'Δυνατότητες' };
+  const CMD_ST = { pending: 'αναμονή κουτιού', sent: 'εκτελείται', done: 'έγινε', failed: 'απέτυχε', expired: 'έληξε' };
+  let cp = null;
+  F.closeCamera = () => { if (cp) { clearInterval(cp.timer); cp.el.remove(); cp = null; } };
+  F.openCamera = async (camId, incidentId) => {
+    F.closeCamera();
+    const el = document.createElement('section'); el.className = 'campanel'; el.setAttribute('role', 'dialog'); el.setAttribute('aria-label', 'Έλεγχος κάμερας');
+    el.innerHTML = '<div class="empty">Φόρτωση…</div>'; document.body.appendChild(el);
+    cp = { el, camId, incidentId, data: null, timer: setInterval(() => cp && reloadCamera(), 5000) };
+    await reloadCamera();
+    // with a box: show the live picture in the console while controlling the camera
+    if (incidentId && cp && cp.data && cp.data.edge && S.view === 'console' && F.liveCam() !== camId && $('#camView')) { F.startLive(camId, $('#camView')); renderIncident(); }
+  };
+  async function reloadCamera() {
+    if (!cp) return;
+    try { cp.data = await api(`/api/cameras/${cp.camId}/control`); } catch (e) { cp.el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+    renderCamera();
+  }
+  function renderCamera() {
+    const d = cp.data, caps = d.caps || {}, edge = d.edge, canBoot = ['admin', 'supervisor'].includes(S.me.role);
+    const seg = (name, opts, cur) => `<div class="seg">${opts.map(([v, l]) => `<button type="button" data-${name}="${v}" class="${v === cur ? 'on' : ''}">${l}</button>`).join('')}</div>`;
+    const ctl = !edge ? '<p class="mut">Η κάμερα δεν συνδέεται μέσω κουτιού: από εδώ γίνεται μόνο ο οπλισμός.</p>'
+      : !edge.online ? '<p class="err">Το κουτί δεν επικοινωνεί. Οι εντολές θα σταλούν όταν επανέλθει (έως 60″).</p>' : '';
+    const noCaps = edge && !caps.onvif ? `<p class="mut">Το κουτί δεν έχει αναφέρει δυνατότητες ONVIF για αυτή την κάμερα. Χρειάζεται έκδοση κουτιού 1.3 και <code>"onvif": true</code> στο config της κάμερας.</p>
+      <button type="button" class="btn sm" data-cmd="caps">Ανάγνωση δυνατοτήτων</button>` : '';
+    cp.el.innerHTML = `
+      <div class="cp-h"><div><b>${esc(d.name)}</b><div class="mut">${esc(d.org_name)}${caps.info ? ` · ${esc(caps.info.manufacturer)} ${esc(caps.info.model)}` : ''}</div></div>
+        <button type="button" class="btn sm ghost" id="cpX" aria-label="Κλείσιμο">✕</button></div>
+      <div class="cp-s"><h4>Οπλισμός <span class="pill ${d.armed_now ? 'ack' : ''}">${d.armed_now ? 'οπλισμένη τώρα' : 'αφόπλιστη τώρα'}</span></h4>
+        ${seg('arm', [['inherit', `Όπως η επιχείρηση <small>(${d.org_armed ? 'οπλισμένη' : 'αφόπλιστη'})</small>`], ['armed', 'Οπλισμένη'], ['disarmed', 'Αφοπλισμένη']], d.arming_mode)}
+        <p class="mut small">Αφοπλισμένη: τα σήματα της κάμερας καταγράφονται αλλά δεν δημιουργούν συναγερμό. Οπλισμένη: δημιουργεί συναγερμό ακόμα κι εκτός ωραρίου της επιχείρησης.</p></div>
+      ${ctl}${noCaps}
+      ${caps.ptz ? `<div class="cp-s"><h4>Κίνηση (PTZ)</h4><div class="ptz">
+          <button type="button" data-mv="-1,1"></button><button type="button" data-mv="0,1" aria-label="Πάνω">▲</button><button type="button" data-mv="1,1"></button>
+          <button type="button" data-mv="-1,0" aria-label="Αριστερά">◀</button><button type="button" data-cmd="ptz_home" title="Αρχική θέση">⌂</button><button type="button" data-mv="1,0" aria-label="Δεξιά">▶</button>
+          <button type="button" data-mv="-1,-1"></button><button type="button" data-mv="0,-1" aria-label="Κάτω">▼</button><button type="button" data-mv="1,-1"></button></div>
+        <div class="ptz-z"><button type="button" class="btn sm" data-zoom="1">Ζουμ +</button><button type="button" class="btn sm" data-zoom="-1">Ζουμ −</button>
+          <label class="mut">Βήμα <select id="cpStep"><option value="0.3">μικρό</option><option value="0.7" selected>μεσαίο</option><option value="1.5">μεγάλο</option></select></label></div>
+        <h4>Θέσεις</h4><div class="cp-presets">${(caps.presets || []).map(p => `<button type="button" class="btn sm" data-preset="${esc(p.token)}">${esc(p.name)}</button>`).join('') || '<span class="mut">Καμία αποθηκευμένη θέση</span>'}</div>
+        <button type="button" class="btn sm ghost" id="cpSave">+ Αποθήκευση τρέχουσας θέσης</button></div>` : ''}
+      ${(caps.relays || []).length ? `<div class="cp-s"><h4>Έξοδοι κάμερας (σειρήνα, φως κ.λπ.)</h4>${caps.relays.map(r => `<div class="cp-row"><span>${esc(r.name)}</span>
+          <span><button type="button" class="btn sm" data-relay="${esc(r.token)}" data-st="active">Ενεργοποίηση</button> <button type="button" class="btn sm" data-relay="${esc(r.token)}" data-st="inactive">Απενεργοποίηση</button></span></div>`).join('')}</div>` : ''}
+      ${caps.ircut ? `<div class="cp-s"><h4>Ημέρα / νύχτα</h4>${seg('ir', [['ON', 'Ημέρα'], ['OFF', 'Νύχτα (υπέρυθρο)'], ['AUTO', 'Αυτόματο']], caps.ircut)}</div>` : ''}
+      ${caps.onvif && canBoot ? '<div class="cp-s"><button type="button" class="btn sm warn" data-cmd="reboot">Επανεκκίνηση κάμερας</button></div>' : ''}
+      ${d.recent.length ? `<div class="cp-s"><h4>Τελευταίες εντολές</h4><ul class="cp-log">${d.recent.map(q => `<li class="${q.status}"><span>${CMD_LABEL[q.cmd] || q.cmd}</span><span>${CMD_ST[q.status] || q.status}${q.status === 'failed' && q.result && q.result.error ? `: ${esc(q.result.error)}` : ''}</span><time>${hms(q.created)}</time></li>`).join('')}</ul></div>` : ''}`;
+    $('#cpX', cp.el).onclick = F.closeCamera;
+    $$('[data-arm]', cp.el).forEach(b => b.onclick = async () => {
+      try { cp.data = await api(`/api/cameras/${cp.camId}/arming`, { mode: b.dataset.arm, incident_id: cp.incidentId || undefined }); renderCamera(); toast(`Κάμερα: ${ARM[b.dataset.arm].toLowerCase()}`); if (cp.incidentId) scheduleRefresh(); }
+      catch (e) { toast(e.message, 'err'); }
+    });
+    const step = () => +(($('#cpStep', cp.el) || {}).value || 0.7);
+    $$('[data-mv]', cp.el).forEach(b => b.onclick = () => { const [x, y] = b.dataset.mv.split(',').map(Number); command('ptz_move', { pan: x * 0.5, tilt: y * 0.5, zoom: 0, seconds: step() }, true); });
+    $$('[data-zoom]', cp.el).forEach(b => b.onclick = () => command('ptz_move', { pan: 0, tilt: 0, zoom: +b.dataset.zoom * 0.5, seconds: step() }, true));
+    $$('[data-preset]', cp.el).forEach(b => b.onclick = () => command('ptz_preset', { token: b.dataset.preset }));
+    $$('[data-relay]', cp.el).forEach(b => b.onclick = () => command('relay', { token: b.dataset.relay, state: b.dataset.st }));
+    $$('[data-ir]', cp.el).forEach(b => b.onclick = () => command('ircut', { mode: b.dataset.ir }));
+    $$('[data-cmd]', cp.el).forEach(b => b.onclick = () => b.dataset.cmd === 'reboot'
+      ? modal('<h2>Επανεκκίνηση κάμερας;</h2><p>Η κάμερα θα είναι εκτός λειτουργίας για 1-2 λεπτά και δεν θα στέλνει συναγερμούς.</p>', 'Επανεκκίνηση', () => command('reboot', {}))
+      : command(b.dataset.cmd, {}));
+    const sv = $('#cpSave', cp.el);
+    if (sv) sv.onclick = () => modal('<h2>Αποθήκευση θέσης</h2><label for="psN">Όνομα</label><input id="psN" maxlength="40" placeholder="π.χ. Πύλη">', 'Αποθήκευση', () => {
+      const n = $('#psN').value.trim(); if (!n) throw new Error('Δώστε όνομα'); return command('ptz_set_preset', { name: n });
+    });
+  }
+  async function command(cmd, args, quiet) {
+    if (!cp) return;
+    const camId = cp.camId;
+    try {
+      const r = await api(`/api/cameras/${camId}/command`, { cmd, args: { ...args, incident_id: cp.incidentId || undefined } });
+      if (!quiet) toast(`${CMD_LABEL[cmd]}: στάλθηκε στο κουτί`);
+      reloadCamera();
+      for (let k = 0; k < 40; k++) { // the box picks it up within ~10 s, or 2 s while active
+        await new Promise(res => setTimeout(res, 1500));
+        const q = await api(`/api/commands/${r.id}`).catch(() => null);
+        if (!q || ['pending', 'sent'].includes(q.status)) continue;
+        if (q.status === 'done') { if (!quiet) toast(`${CMD_LABEL[cmd]}: έγινε`); } else toast(`${CMD_LABEL[cmd]}: ${CMD_ST[q.status]}${q.result && q.result.error ? ` (${q.result.error})` : ''}`, 'err');
+        if (cp && cp.camId === camId) reloadCamera();
+        return;
+      }
+    } catch (e) { toast(e.message, 'err'); }
+  }
+
   window.Features = F;
 })();

@@ -245,7 +245,9 @@ def ingest(org_id, camera_key, raw_type, target=None, state="active", camera_nam
         reason = "κάμερα απενεργοποιημένη"
     elif cam["snooze_until"] and cam["snooze_until"] > now:
         reason = "κάμερα σε παύση"
-    elif etype not in TECHNICAL and etype != "tamper" and not ignore_arming and not is_armed(org):
+    elif etype not in TECHNICAL and etype != "tamper" and not ignore_arming and cam.get("arming_mode") == "disarmed":
+        reason = "κάμερα αφοπλισμένη"
+    elif etype not in TECHNICAL and etype != "tamper" and not ignore_arming and cam.get("arming_mode") != "armed" and not is_armed(org):
         reason = "αφόπλιστο (εκτός ωραρίου)"
     elif org["allowed_types"] and etype not in org["allowed_types"] and etype not in TECHNICAL:
         reason = "τύπος φιλτραρισμένος"

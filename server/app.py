@@ -36,7 +36,7 @@ ADMIN = {
              "allowed_types", "sop", "ack_timeout", "speaker_presets"],
     "contacts": ["org_id", "name", "role", "phone", "email", "priority", "notify_sms", "notify_email"],
     "edges": ["org_id", "name"],
-    "cameras": ["org_id", "edge_id", "ext_key", "name", "lat", "lon", "enabled", "snooze_until"],
+    "cameras": ["org_id", "edge_id", "ext_key", "name", "lat", "lon", "enabled", "snooze_until", "arming_mode"],
     "docks": ["name", "lat", "lon", "radius_km", "adapter", "serial", "has_speaker", "has_light", "enabled"],
     "users": ["username", "name", "role", "org_id", "active"],
     "nofly": ["name", "lat", "lon", "radius_m", "level", "notes", "enabled"],
@@ -399,7 +399,10 @@ class Handler(BaseHTTPRequestHandler):
                 for c in b.get("cameras", []):
                     cam = logic.get_or_create_camera(edge["org_id"], c["key"], c.get("name"), edge["id"])
                     was = cam["online"]
-                    db.update("cameras", cam["id"], {"last_seen": time.time(), "online": int(bool(c.get("online", True))), "edge_id": edge["id"]})
+                    upd = {"last_seen": time.time(), "online": int(bool(c.get("online", True))), "edge_id": edge["id"]}
+                    if isinstance(c.get("caps"), dict):  # what the camera supports over ONVIF (PTZ, presets, outputs, day/night)
+                        upd["caps"] = json.dumps(c["caps"], ensure_ascii=False)[:8000]
+                    db.update("cameras", cam["id"], upd)
                     if was != int(bool(c.get("online", True))):
                         logic.publish("camera", org_id=edge["org_id"], id=cam["id"], online=bool(c.get("online", True)))
                 ag = features.agent_info(meta_only=True)
@@ -407,6 +410,10 @@ class Handler(BaseHTTPRequestHandler):
                     db.update("edges", edge["id"], {"update_requested": 0})
                     edge["update_requested"] = 0
                 return self.send(200, features.edge_poll(edge))
+            if path == "/api/edge/command" and method == "POST":
+                res = features.command_result(edge, self.json_body())
+                need(res, 404, "Άγνωστη εντολή")
+                return self.send(200, res)
             if path == "/api/edge/poll" and method == "POST":
                 return self.send(200, features.edge_poll(edge))
             if path == "/api/edge/frame" and method == "POST":
@@ -597,6 +604,40 @@ class Handler(BaseHTTPRequestHandler):
                                              features.SUBJECT["value"]) for s in subs]
                 return self.send(200, {"ok": True, "results": res})
             return self.send(200, {"ok": True, **features.push_status(u)})
+
+        # camera control: arming per camera, ONVIF commands through the box
+        m = re.fullmatch(r"/api/cameras/(\d+)/(control|arming|command)", path)
+        if m:
+            u = self.user(roles=features.STAFF)
+            cam = db.q1("SELECT * FROM cameras WHERE id=?", (int(m.group(1)),))
+            need(cam, 404, "Δεν βρέθηκε")
+            if m.group(2) == "control":
+                return self.send(200, features.camera_control(cam))
+            need(method == "POST", 405, "Μη επιτρεπτή μέθοδος")
+            b = self.json_body()
+            if m.group(2) == "arming":
+                mode = b.get("mode")
+                need(mode in features.ARMING, 400, "Οπλισμός: inherit, armed ή disarmed")
+                db.update("cameras", cam["id"], {"arming_mode": mode})
+                logic.audit(u["name"], "camera.arming", f"{cam['name']}: {features.ARMING[mode]}")
+                if b.get("incident_id"):
+                    logic.add_timeline(int(b["incident_id"]), f"Κάμερα «{cam['name']}»: {features.ARMING[mode].lower()}", u["name"], "camera")
+                logic.publish("camera", org_id=cam["org_id"], id=cam["id"])
+                return self.send(200, features.camera_control(db.q1("SELECT * FROM cameras WHERE id=?", (cam["id"],))))
+            need(cam["edge_id"], 409, "Η κάμερα δεν συνδέεται μέσω κουτιού, άρα δεν δέχεται εντολές")
+            try:
+                cid = features.queue_command(cam, u, b.get("cmd"), b.get("args") or {})
+            except PermissionError as e:
+                raise ApiError(403, str(e))
+            except (ValueError, TypeError) as e:
+                raise ApiError(400, str(e))
+            return self.send(200, {"ok": True, "id": cid})
+        m = re.fullmatch(r"/api/commands/(\d+)", path)
+        if m:
+            self.user(roles=features.STAFF)
+            q = features.command_view(int(m.group(1)))
+            need(q, 404, "Δεν βρέθηκε")
+            return self.send(200, q)
 
         # near-live camera image (through the edge box)
         m = re.fullmatch(r"/api/cameras/(\d+)/(live|frame)", path)

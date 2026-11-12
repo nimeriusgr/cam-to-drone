@@ -39,7 +39,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 log = logging.getLogger("edge")
 
 # ------------------------------------------------------------------ type normalisation (same names as the server)
@@ -482,6 +482,112 @@ class GpioWorker(Worker):
 KINDS = {"hikvision": HikvisionWorker, "dahua": DahuaWorker, "onvif": OnvifWorker, "webhook": PushCamera, "gpio": GpioWorker}
 
 
+class OnvifControl:
+    """Camera control over ONVIF (needs onvif-zeep): device info, PTZ with presets, relay outputs (siren, light),
+    day/night (IR cut filter) and reboot. Works for any camera with ONVIF: kind "onvif", or set "onvif": true
+    (and "onvif_port" if it is not the web port) on Hikvision / Dahua / push cameras."""
+
+    @staticmethod
+    def wanted(w):
+        c = w.cam
+        return not c.get("channels") and c.get("host") and c.get("user") is not None and \
+            (c.get("kind") == "onvif" or c.get("onvif") or c.get("onvif_port")) and c.get("onvif") is not False
+
+    def __init__(self, cam):
+        self.cam = cam
+        self.lock = threading.Lock()
+        self.c = None
+
+    def connect(self):
+        if self.c:
+            return self.c
+        try:
+            from onvif import ONVIFCamera  # type: ignore
+        except ImportError:
+            raise RuntimeError("λείπει το πακέτο onvif-zeep")
+        c = ONVIFCamera(self.cam["host"], int(self.cam.get("onvif_port") or self.cam.get("port", 80)), self.cam["user"], self.cam["password"])
+        self.media = c.create_media_service()
+        prof = self.media.GetProfiles()[0]
+        self.profile = prof.token
+        vsc = getattr(prof, "VideoSourceConfiguration", None)
+        self.source = getattr(vsc, "SourceToken", None) if vsc else None
+        self.c = c
+        return c
+
+    def _ptz(self):
+        if not getattr(self, "ptz", None):
+            self.ptz = self.connect().create_ptz_service()
+        return self.ptz
+
+    def _imaging(self):
+        if not getattr(self, "imaging", None):
+            self.imaging = self.connect().create_imaging_service()
+        return self.imaging
+
+    def capabilities(self):
+        with self.lock:
+            c = self.connect()
+            out = {"onvif": True}
+            try:
+                i = c.devicemgmt.GetDeviceInformation()
+                out["info"] = {"manufacturer": str(i.Manufacturer), "model": str(i.Model), "firmware": str(i.FirmwareVersion)}
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                presets = self._ptz().GetPresets({"ProfileToken": self.profile}) or []
+                out["ptz"] = True
+                out["presets"] = [{"token": str(p.token), "name": str(getattr(p, "Name", "") or p.token)} for p in presets][:50]
+            except Exception:  # noqa: BLE001
+                self.ptz = None
+            try:
+                relays = c.devicemgmt.GetRelayOutputs() or []
+                if relays:
+                    out["relays"] = [{"token": str(r.token), "name": self.cam.get("relay_names", {}).get(str(r.token), f"Έξοδος {k + 1}")} for k, r in enumerate(relays)]
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                if self.source:
+                    s = self._imaging().GetImagingSettings({"VideoSourceToken": self.source})
+                    if getattr(s, "IrCutFilter", None) is not None:
+                        out["ircut"] = str(s.IrCutFilter)
+            except Exception:  # noqa: BLE001
+                pass
+            return out
+
+    def run(self, cmd, a):
+        if cmd == "caps":
+            return {"caps": self.capabilities()}
+        with self.lock:
+            c = self.connect()
+            if cmd == "ptz_move":
+                vel = {"PanTilt": {"x": float(a.get("pan", 0)), "y": float(a.get("tilt", 0))}, "Zoom": {"x": float(a.get("zoom", 0))}}
+                self._ptz().ContinuousMove({"ProfileToken": self.profile, "Velocity": vel})
+                time.sleep(float(a.get("seconds", 0.6)))
+                self._ptz().Stop({"ProfileToken": self.profile, "PanTilt": True, "Zoom": True})
+            elif cmd == "ptz_stop":
+                self._ptz().Stop({"ProfileToken": self.profile, "PanTilt": True, "Zoom": True})
+            elif cmd == "ptz_home":
+                self._ptz().GotoHomePosition({"ProfileToken": self.profile})
+            elif cmd == "ptz_preset":
+                self._ptz().GotoPreset({"ProfileToken": self.profile, "PresetToken": a["token"]})
+            elif cmd == "ptz_set_preset":
+                tok = self._ptz().SetPreset({"ProfileToken": self.profile, "PresetName": a["name"]})
+                return {"token": str(tok)}
+            elif cmd == "relay":
+                c.devicemgmt.SetRelayOutputState({"RelayOutputToken": a["token"], "LogicalState": a["state"]})
+            elif cmd == "ircut":
+                if not self.source:
+                    raise RuntimeError("άγνωστη πηγή εικόνας")
+                self._imaging().SetImagingSettings({"VideoSourceToken": self.source, "ImagingSettings": {"IrCutFilter": a["mode"]},
+                                                    "ForcePersistence": True})
+            elif cmd == "reboot":
+                c.devicemgmt.SystemReboot()
+                self.c = self.ptz = self.imaging = None
+            else:
+                raise RuntimeError(f"άγνωστη εντολή {cmd}")
+            return {}
+
+
 # ------------------------------------------------------------------ agent
 class Recorder(threading.Thread):
     """Keeps the last few seconds of one camera in short MPEG-TS segments (ffmpeg, stream copy, no re-encoding),
@@ -560,6 +666,8 @@ class Agent:
         self.live = set()
         self.stream_procs = {}
         self.ffmpeg_warned = False
+        self.controls = {}  # camera key -> OnvifControl
+        self.caps = {}      # camera key -> capabilities reported to the server
         self.recorders = {}
         self.update_failed = None
         clips = cfg.get("clips") or {}
@@ -680,6 +788,8 @@ class Agent:
             log.info("live view: %s", ", ".join(sorted(live)) or "off")
         self.live = live
         self.sync_streams(res.get("streams") or {})
+        for c in res.get("commands") or []:
+            threading.Thread(target=self.run_command, args=(c,), daemon=True, name=f"cmd-{c.get('id')}").start()
         ag = res.get("agent") or {}
         auto = self.cfg.get("auto_update", True)
         if ag.get("version") and ag.get("sha256") and ag["sha256"] != self.update_failed:
@@ -748,12 +858,54 @@ class Agent:
         if key in self.recorders:
             threading.Thread(target=self.send_clip, args=(key, now), daemon=True).start()
 
+    # ---- camera control over ONVIF (commands from the console)
+    def _controls(self):
+        for w in self.workers:
+            if OnvifControl.wanted(w):
+                key = w.keys()[0][0]
+                self.controls[key] = OnvifControl(w.cam)
+        if self.controls:
+            threading.Thread(target=self.caps_loop, daemon=True, name="onvif-caps").start()
+
+    def caps_loop(self):
+        """Reads what each camera supports at start and every 10 minutes; reported with the heartbeat."""
+        while True:
+            for key, ctl in self.controls.items():
+                try:
+                    self.caps[key] = ctl.capabilities()
+                except Exception as e:  # noqa: BLE001
+                    log.info("[%s] ONVIF capabilities: %s", key, e)
+            time.sleep(600)
+
+    def run_command(self, c):
+        key, cmd, args = c.get("camera_key"), c.get("cmd"), c.get("args") or {}
+        ctl = self.controls.get(key)
+        try:
+            if not ctl:
+                raise RuntimeError("η κάμερα δεν ελέγχεται μέσω ONVIF από αυτό το κουτί")
+            result = ctl.run(cmd, args)
+            if cmd in ("caps", "ptz_set_preset"):
+                self.caps[key] = result["caps"] if cmd == "caps" else ctl.capabilities()
+                result = {**(result or {}), "caps": self.caps[key]}
+            elif cmd == "ircut" and key in self.caps:  # report the new day/night mode right away
+                self.caps[key] = {**self.caps[key], "ircut": args.get("mode")}
+                result = {**(result or {}), "caps": self.caps[key]}
+            body = {"id": c["id"], "ok": True, "result": result}
+            log.info("[%s] command %s ok", key, cmd)
+        except Exception as e:  # noqa: BLE001
+            body = {"id": c["id"], "ok": False, "error": str(e)[:300]}
+            log.warning("[%s] command %s failed: %s", key, cmd, e)
+        try:
+            self.up.post("/api/edge/command", body, timeout=10)
+        except Exception as e:  # noqa: BLE001
+            log.warning("command result not delivered: %s", e)
+
     def heartbeat(self):
         cams = []
         for w in self.workers:
             online = w.connected if not isinstance(w, PushCamera) else (time.time() - getattr(w, "last", 0) < 3600 or getattr(w, "last", 0) == 0)
             for key, name in w.keys():
-                cams.append({"key": key, "name": name, "online": bool(online)})
+                cams.append({"key": key, "name": name, "online": bool(online), **({"caps": self.caps[key]} if key in self.caps else {})})
         res = self.up.post("/api/edge/heartbeat", {"version": VERSION, "cameras": cams, "hostname": socket.gethostname()})
         self.up.online = True
         skew = abs(res.get("server_time", time.time()) - time.time())
@@ -763,16 +915,19 @@ class Agent:
         return res
 
     def control_loop(self):
-        """Heartbeat every 30s. While the site has an open incident or someone watches live, also poll every 2s."""
+        """Heartbeat every 30s. Between them a light poll: every 2s while the site has an open incident, someone watches
+        live or sends camera commands; otherwise every 10s (idle_poll_seconds), so a command reaches the camera quickly."""
         every = float(self.cfg.get("heartbeat_seconds", 30))
-        last = 0
+        idle = float(self.cfg.get("idle_poll_seconds", 10))
+        last = last_poll = 0
         while True:
             try:
                 if time.time() - last >= every:
                     res = self.heartbeat()
-                    last = time.time()
-                elif self.fast:
+                    last = last_poll = time.time()
+                elif self.fast or time.time() - last_poll >= idle:
                     res = self.up.post("/api/edge/poll", {}, timeout=10)
+                    last_poll = time.time()
                 else:
                     res = None
                 if res:
@@ -790,6 +945,7 @@ class Agent:
         for w in self.workers:
             w.start()
         self._recorders()
+        self._controls()
         threading.Thread(target=self.frame_loop, daemon=True, name="frames").start()
         log.info("edge agent %s started with %d sources", VERSION, len(self.workers))
         self.control_loop()

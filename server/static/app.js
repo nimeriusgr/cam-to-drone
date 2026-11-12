@@ -231,12 +231,14 @@ function renderIncident() {
     + clips.map(c => `<button class="clipbtn ${!live && 'clip:' + c.name === S.imgSel ? 'on' : ''}" data-n="clip:${esc(c.name)}" title="${esc(c.camera || '')}">▶ ${hm(c.ts)}</button>`).join('')
     + (i.images.length > 1 || clips.length ? '' : `<span class="mut">${i.count} σήμα${i.count > 1 ? 'τα' : ''} · ${i.camera_list.map(c => esc(c.name)).join(', ')}</span>`)
     + (liveCams.length ? `<span class="sp"></span>${liveCams.length > 1 ? `<select id="liveCam" aria-label="Κάμερα για ζωντανή εικόνα">${liveCams.map(c => `<option value="${c.id}" ${live === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>` : ''}
-       <button class="btn sm ${live ? 'on' : ''}" id="liveBtn">${live ? 'Τέλος ζωντανής' : 'Ζωντανά'}</button>` : '');
+       <button class="btn sm ${live ? 'on' : ''}" id="liveBtn">${live ? 'Τέλος ζωντανής' : 'Ζωντανά'}</button>
+       <button class="btn sm" id="ctlBtn" title="Οπλισμός, κίνηση, θέσεις, έξοδοι κάμερας">Έλεγχος ⚙</button>` : '');
   if ($('#camThumbs').dataset.h !== th) {
     $('#camThumbs').innerHTML = th; $('#camThumbs').dataset.h = th;
     $$('#camThumbs [data-n]').forEach(t => t.onclick = () => { window.Features && Features.stopLive(); S.imgSel = t.dataset.n; renderIncident(); });
     const lb = $('#liveBtn');
     if (lb) lb.onclick = () => { if (Features.liveCam()) { Features.stopLive(); $('#camView').dataset.img = ''; } else Features.startLive(+($('#liveCam') ? $('#liveCam').value : liveCams[0].id), $('#camView')); renderIncident(); };
+    const cb = $('#ctlBtn'); if (cb) cb.onclick = () => Features.openCamera(+(Features.liveCam() || ($('#liveCam') ? $('#liveCam').value : liveCams[0].id)), S.sel);
     const ls = $('#liveCam'); if (ls) ls.onchange = () => { if (Features.liveCam()) { Features.startLive(+ls.value, $('#camView')); } };
   }
   // drone
@@ -307,7 +309,8 @@ function sideHtml(i, m, flying, closed, cust) {
     </div>`;
   const info = `<div class="sec"><h3>Στοιχεία</h3><dl class="kv">
       <dt>Διεύθυνση</dt><dd>${esc(org.address || '—')}</dd>
-      <dt>Κάμερες</dt><dd>${i.camera_list.map(c => esc(c.name)).join(', ')}</dd>
+      <dt>Κάμερες</dt><dd>${cust ? i.camera_list.map(c => esc(c.name)).join(', ')
+        : `<div class="cam-ctl">${i.camera_list.map(c => `<button class="btn sm" data-camctl="${c.id}" title="Οπλισμός και έλεγχος κάμερας">${esc(c.name)} ⚙</button>`).join('')}</div>`}</dd>
       ${org.notes ? `<dt>Σημειώσεις</dt><dd>${esc(org.notes)}</dd>` : ''}
       ${closed ? `<dt>Αποτέλεσμα</dt><dd>${esc(i.outcome)}</dd>${i.note ? `<dt>Σημείωση</dt><dd>${esc(i.note)}</dd>` : ''}` : ''}
     </dl></div>`;
@@ -350,6 +353,7 @@ function assignHtml(i) {
     ${[...people].map(([id, n]) => `<option value="${id}" ${i.assigned_user === id ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select></div>`;
 }
 function bindSide(i, m) {
+  $$('#side [data-camctl]').forEach(b => b.onclick = () => Features.openCamera(+b.dataset.camctl, i.id));
   const as = $('#asSel'); if (as) as.onchange = () => send({ action: 'assign', user_id: as.value ? +as.value : null }, as.value ? 'Έγινε ανάθεση' : 'Έγινε αποδέσμευση');
   $$('#side [data-a]').forEach(b => b.onclick = () => act(b.dataset.a));
   $$('#side [data-sop]').forEach(c => c.onchange = () => send({ action: 'sop', step: +c.dataset.sop, done: c.checked }));
@@ -536,7 +540,9 @@ window.modal = modal; window.toast = toast; window.api = api; window.esc = esc;
 /* ------------------------------------------------------------ map */
 function initMap() {
   if (S.map || typeof L === 'undefined') { if (typeof L === 'undefined') $('#map').innerHTML = '<div class="empty" style="padding-top:60px">Ο χάρτης χρειάζεται σύνδεση στο internet</div>'; return; }
-  S.map = L.map('map', { zoomControl: true, attributionControl: true }).setView([37.98, 23.73], 10);
+  // on phones one finger scrolls the page, not the map; the map moves with two fingers (pinch) or the +/- buttons
+  const touch = matchMedia('(pointer: coarse)').matches;
+  S.map = L.map('map', { zoomControl: true, attributionControl: true, dragging: !touch }).setView([37.98, 23.73], 10);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(S.map);
   S.layers.base = L.layerGroup().addTo(S.map); S.layers.live = L.layerGroup().addTo(S.map);
   $('#legend').innerHTML = '<span><i class="mk alarm" style="box-shadow:none"></i>Συναγερμός</span><span><i class="mk ok"></i>Οπλισμένη</span><span><i class="mk off"></i>Αφόπλιστη</span><span><i class="mk-dock"></i>Dock</span><span><i class="mk-drone" style="width:12px;height:12px;border-width:3px"></i>Drone</span><span><i class="mk-zone"></i>Ζώνη απαγόρευσης</span>';

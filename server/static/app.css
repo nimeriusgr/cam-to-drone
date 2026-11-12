@@ -330,3 +330,43 @@ body.customer .stats,body.customer #soundBtn,body.customer .clock{display:none}
 .viewer .snd{position:absolute;left:8px;bottom:8px;z-index:2;background:rgba(10,15,21,.75)}
 .viewer .live-msg{position:absolute;inset:auto 0 40%;text-align:center;pointer-events:none}
 #droneHud{z-index:1}
+
+/* ---------- camera control panel */
+.campanel{position:fixed;right:14px;top:60px;bottom:14px;width:min(380px,calc(100vw - 28px));z-index:1500;background:var(--card);border:1px solid var(--line2);border-radius:14px;box-shadow:0 12px 36px rgba(0,0,0,.5);overflow:auto;padding:12px 14px}
+.cp-h{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:6px}
+.cp-s{border-top:1px solid var(--line);padding:10px 0}
+.cp-s h4{margin:0 0 8px;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);font-weight:600;display:flex;gap:8px;align-items:center}
+.cp-s .small{font-size:11.5px;margin:8px 0 0}
+.seg{display:flex;border:1px solid var(--line2);border-radius:9px;overflow:hidden}
+.seg button{flex:1;background:var(--bg);border:0;border-left:1px solid var(--line2);padding:7px 6px;font-size:12px;color:var(--ink2);line-height:1.25}
+.seg button:first-child{border-left:0}.seg button.on{background:var(--blue);color:#fff;font-weight:600}.seg small{font-weight:400;opacity:.85}
+.ptz{display:grid;grid-template-columns:repeat(3,52px);grid-template-rows:repeat(3,44px);gap:4px;justify-content:center;margin:2px 0 8px}
+.ptz button{background:var(--card2);border:1px solid var(--line2);border-radius:8px;font-size:16px}
+.ptz button:hover{border-color:var(--blue2)}.ptz button:active{background:var(--blue)}
+.ptz-z{display:flex;gap:6px;align-items:center;justify-content:center;flex-wrap:wrap;margin-bottom:10px}
+.ptz-z select{background:var(--bg);border:1px solid var(--line2);border-radius:6px;padding:2px 4px}
+.cp-presets{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.cp-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0}
+.cp-log{list-style:none;margin:0;padding:0;font-size:12px}.cp-log li{display:grid;grid-template-columns:1fr auto auto;gap:8px;padding:3px 0;border-bottom:1px solid var(--line)}
+.cp-log time{color:var(--mut);font-variant-numeric:tabular-nums}.cp-log li.failed span:nth-child(2),.cp-log li.expired span:nth-child(2){color:#fca5a5}.cp-log li.done span:nth-child(2){color:var(--green)}
+.cam-ctl{display:flex;flex-wrap:wrap;gap:6px}
+.tl li.camera span{color:var(--ink2)}
+@media (max-width:640px){.campanel{top:auto;left:0;right:0;bottom:0;width:auto;max-height:80vh;border-radius:16px 16px 0 0}}
+
+/* ---------- phones: no auto-zoom on fields, map legend under the map, nothing wider than the screen */
+@media (max-width:900px), (pointer:coarse){
+  input,select,textarea,.pane-h select,.assign select,.thumbs select,.tts input{font-size:16px}
+}
+@media (max-width:640px){
+  html,body{max-width:100%;overflow-x:hidden}
+  .center{grid-template-rows:auto auto}
+  .mapwrap{display:flex;flex-direction:column;min-height:0}
+  #map{position:relative;inset:auto;height:300px;flex:none}
+  .map-legend{position:static;flex-wrap:wrap;gap:6px 12px;border:0;border-top:1px solid var(--line);border-radius:0;background:transparent;padding:8px 10px}
+  .side,.pane{min-width:0}
+  .kv{grid-template-columns:minmax(0,auto) minmax(0,1fr)}
+  .ih .row{row-gap:4px}
+  .btns .btn{min-height:42px}
+  .contact{flex-wrap:wrap}
+  .contact .n{flex-basis:100%}
+}

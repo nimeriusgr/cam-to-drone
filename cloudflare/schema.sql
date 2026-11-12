@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS edges(
 CREATE TABLE IF NOT EXISTS cameras(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, edge_id INTEGER, ext_key TEXT NOT NULL,
   name TEXT NOT NULL, lat REAL, lon REAL, enabled INTEGER DEFAULT 1, snooze_until REAL,
-  last_seen REAL, online INTEGER DEFAULT 1, UNIQUE(org_id, ext_key));
+  last_seen REAL, online INTEGER DEFAULT 1, arming_mode TEXT DEFAULT 'inherit', caps TEXT, UNIQUE(org_id, ext_key));
 CREATE TABLE IF NOT EXISTS docks(
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
   radius_km REAL DEFAULT 5, adapter TEXT DEFAULT 'sim', serial TEXT DEFAULT '',
@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS push_subs(
   id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, endpoint TEXT UNIQUE NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, ts REAL);
 CREATE TABLE IF NOT EXISTS live_req(camera_id INTEGER PRIMARY KEY, until REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS live_frames(camera_id INTEGER PRIMARY KEY, ts REAL NOT NULL, ctype TEXT NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cam_commands(
+  id INTEGER PRIMARY KEY, camera_id INTEGER NOT NULL, edge_id INTEGER NOT NULL, cmd TEXT NOT NULL, args TEXT DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending', result TEXT, who TEXT, created REAL NOT NULL, sent_ts REAL, done_ts REAL);
+CREATE INDEX IF NOT EXISTS ix_cmd_edge ON cam_commands(edge_id, status);
 CREATE INDEX IF NOT EXISTS ix_inc_first ON incidents(first_ts);
 CREATE INDEX IF NOT EXISTS ix_ev_cam ON events(camera_id, ts);
 CREATE INDEX IF NOT EXISTS ix_shift_open ON shifts(end_ts);
