@@ -39,7 +39,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 log = logging.getLogger("edge")
 
 # ------------------------------------------------------------------ type normalisation (same names as the server)
@@ -558,6 +558,8 @@ class Agent:
         self.throttle = float(cfg.get("throttle_seconds", 10))
         self.fast = False
         self.live = set()
+        self.stream_procs = {}
+        self.ffmpeg_warned = False
         self.recorders = {}
         self.update_failed = None
         clips = cfg.get("clips") or {}
@@ -618,8 +620,8 @@ class Agent:
             t0 = time.time()
             for key in keys:
                 w = self.by_key(key)
-                if not w:
-                    continue
+                if not w or self.streaming(key):
+                    continue  # a real video stream is running for this camera, no snapshots needed
                 img, ext = w.snapshot(w.channel_of(key))
                 if img:
                     try:
@@ -628,12 +630,56 @@ class Agent:
                         log.debug("frame %s: %s", key, e)
             time.sleep(max(0.2, 1 - (time.time() - t0)))
 
+    # ---- live video + audio to the media server (only when the central server has one configured)
+    def streaming(self, key):
+        p = self.stream_procs.get(key)
+        return bool(p and p[0].poll() is None)
+
+    @staticmethod
+    def stream_cmd(src, dest):
+        """Video is copied as is (use the camera's H.264 sub-stream); audio, if the camera has it, is converted
+        to what the target accepts: Opus for RTSP/WebRTC servers, AAC for RTMP/SRT."""
+        inp = ["-rtsp_transport", "tcp"] if src.startswith("rtsp") else []
+        if dest.startswith(("rtmp://", "rtmps://")):
+            out = ["-c:a", "aac", "-b:a", "64k", "-ar", "44100", "-f", "flv"]
+        elif dest.startswith("srt://"):
+            out = ["-c:a", "aac", "-b:a", "64k", "-ar", "44100", "-f", "mpegts"]
+        else:
+            out = ["-c:a", "libopus", "-b:a", "32k", "-ar", "48000", "-ac", "1", "-f", "rtsp", "-rtsp_transport", "tcp"]
+        return ["ffmpeg", "-nostdin", "-loglevel", "error", *inp, "-i", src, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *out, dest]
+
+    def sync_streams(self, wanted):
+        if wanted and not shutil.which("ffmpeg"):
+            if not self.ffmpeg_warned:
+                log.error("live video needs ffmpeg (sudo apt install ffmpeg); sending snapshots instead")
+                self.ffmpeg_warned = True
+            return
+        for key, (p, _) in list(self.stream_procs.items()):
+            if key not in wanted:
+                p.terminate()
+                del self.stream_procs[key]
+                log.info("[%s] live stream stopped", key)
+        for key, dest in wanted.items():
+            cur = self.stream_procs.get(key)
+            if cur and cur[0].poll() is None:
+                continue
+            if cur and time.time() - cur[1] < 5:
+                continue  # it just failed; do not hammer the camera
+            w = self.by_key(key)
+            src = w and w.rtsp(w.channel_of(key))
+            if not src:
+                log.warning("[%s] no RTSP address for live video (set \"rtsp\" in config.json); sending snapshots", key)
+                continue
+            self.stream_procs[key] = (subprocess.Popen(self.stream_cmd(src, dest), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), time.time())
+            log.info("[%s] live stream started", key)
+
     def apply(self, res):
         self.fast = bool(res.get("fast"))
         live = set(res.get("live") or [])
         if live != self.live:
             log.info("live view: %s", ", ".join(sorted(live)) or "off")
         self.live = live
+        self.sync_streams(res.get("streams") or {})
         ag = res.get("agent") or {}
         auto = self.cfg.get("auto_update", True)
         if ag.get("version") and ag.get("sha256") and ag["sha256"] != self.update_failed:

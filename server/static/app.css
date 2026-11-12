@@ -327,3 +327,6 @@ body.customer .stats,body.customer #soundBtn,body.customer .clock{display:none}
 .pp-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
 .pp-chips{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 2px}.pp-chips .chip{cursor:pointer}
 .tl li.postpone span{color:var(--amber)}
+.viewer .snd{position:absolute;left:8px;bottom:8px;z-index:2;background:rgba(10,15,21,.75)}
+.viewer .live-msg{position:absolute;inset:auto 0 40%;text-align:center;pointer-events:none}
+#droneHud{z-index:1}

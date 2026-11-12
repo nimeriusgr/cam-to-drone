@@ -384,20 +384,45 @@ def store_frame(cam_id, data, ctype):
         _frames[cam_id] = (time.time(), data, ctype)
 
 
-def live_keys(edge_id):
+def live_cams(edge_id):
     now = time.time()
     with _live_lock:
         ids = [c for c, until in _live_req.items() if until > now]
     if not ids:
         return []
-    return [r["ext_key"] for r in db.q(f"SELECT ext_key FROM cameras WHERE edge_id=? AND id IN ({','.join('?' * len(ids))})", [edge_id] + ids)]
+    return db.q(f"SELECT id, ext_key FROM cameras WHERE edge_id=? AND id IN ({','.join('?' * len(ids))})", [edge_id] + ids)
 
 
 def edge_poll(edge):
-    live = live_keys(edge["id"])
+    cams = live_cams(edge["id"])
     busy = db.q1("SELECT 1 AS x FROM incidents WHERE org_id=? AND status!='closed' LIMIT 1", (edge["org_id"],))
-    return {"ok": True, "server_time": time.time(), "fast": bool(busy or live), "live": live,
+    media = media_cfg()
+    return {"ok": True, "server_time": time.time(), "fast": bool(busy or cams), "live": [c["ext_key"] for c in cams],
+            # with a media server: the box streams video+audio there instead of sending snapshots
+            "streams": {c["ext_key"]: media_url(media["publish"], media_path("cam", c["id"])) for c in cams} if media.get("publish") else {},
             "update": bool(edge.get("update_requested")), "agent": agent_info(meta_only=True)}
+
+
+# ================================================================== live video + audio through a media server (MediaMTX, Cloudflare Stream...)
+# Settings `media`: publish = where the box sends (e.g. rtsp://user:pass@media.example.com:8554/{path}),
+# play = WHEP address the browser plays with WebRTC (e.g. https://media.example.com:8889/{path}/whep).
+# {path} is unguessable per camera / dock, derived from a secret kept in the settings.
+def media_cfg():
+    return db.setting("media", {}) or {}
+
+
+def media_path(kind, ident):
+    secret = media_cfg().get("secret", "")
+    return f"{kind}{ident}_" + hashlib.sha256(f"{secret}:{kind}{ident}".encode()).hexdigest()[:16]
+
+
+def media_url(tpl, path):
+    return (tpl or "").replace("{path}", path)
+
+
+def media_play(kind, ident):
+    m = media_cfg()
+    return media_url(m["play"], media_path(kind, ident)) if m.get("play") and m.get("publish") else None
 
 
 # ================================================================== alarm clips

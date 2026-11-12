@@ -58,18 +58,55 @@
     }
   }
 
-  /* ================================================================ live camera (about one frame per second through the edge box) */
+  /* ================================================================ WebRTC playback (WHEP) from the media server: video + sound, about 1 s delay */
+  F.whep = async (url, video) => {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
+    pc.addTransceiver('video', { direction: 'recvonly' }); pc.addTransceiver('audio', { direction: 'recvonly' });
+    const ms = new MediaStream(); video.srcObject = ms; pc.ontrack = e => ms.addTrack(e.track);
+    await pc.setLocalDescription(await pc.createOffer());
+    await new Promise(r => { if (pc.iceGatheringState === 'complete') return r(); const t = setTimeout(r, 2000); pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); r(); } }; });
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
+    if (!res.ok) { pc.close(); throw new Error(`HTTP ${res.status}`); }
+    await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
+    const loc = res.headers.get('Location');
+    return () => { pc.close(); if (loc) fetch(new URL(loc, url), { method: 'DELETE' }).catch(() => { }); };
+  };
+  // <video> with a sound button (browsers start video muted; one click turns sound on)
+  F.videoHtml = (label) => `<video autoplay muted playsinline></video><div class="live-msg empty">${label}</div>
+    <span class="live-tag">LIVE</span><button type="button" class="btn sm snd">🔇 Ήχος</button>`;
+  F.bindSound = box => { const v = $('video', box), b = $('.snd', box); b.onclick = () => { v.muted = !v.muted; if (!v.muted) v.play().catch(() => { }); b.textContent = v.muted ? '🔇 Ήχος' : '🔊 Ήχος'; }; };
+
+  /* ================================================================ live camera: real video+sound through the media server, or ~1 frame/s through the box */
   let live = null;
   F.liveCam = () => live && live.cam;
-  F.stopLive = () => { if (live) { clearInterval(live.timer); live = null; } };
-  F.startLive = (cam, box) => {
+  F.stopLive = () => { if (live) { clearInterval(live.timer); if (live.close) live.close(); live.dead = true; live = null; } };
+  F.startLive = async (cam, box) => {
     F.stopLive();
     box.dataset.img = 'live:' + cam;
+    const me = live = { cam, timer: null };
+    let st;
+    try { st = await api(`/api/cameras/${cam}/live`); } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+    if (me.dead) return;
+    if (st.whep && 'RTCPeerConnection' in window) return startVideo(me, st, box);
+    startFrames(me, cam, box);
+  };
+  async function startVideo(me, st, box) {
+    box.innerHTML = F.videoHtml('Το κουτί ξεκινά τη ροή βίντεο…'); F.bindSound(box);
+    const v = $('video', box), msg = $('.live-msg', box);
+    v.onplaying = () => { msg.hidden = true; };
+    me.timer = setInterval(() => api(`/api/cameras/${me.cam}/live`).catch(() => { }), 10000); // keeps the box streaming
+    for (let k = 0; k < 15 && !me.dead; k++) { // the box needs a few seconds to start sending
+      try { const close = await F.whep(st.whep, v); if (me.dead) close(); else me.close = close; return; }
+      catch { await new Promise(r => setTimeout(r, 2000)); }
+    }
+    if (!me.dead) { msg.textContent = 'Δεν ήρθε βίντεο από τον media server. Εμφάνιση εικόνας ανά δευτερόλεπτο.'; clearInterval(me.timer); setTimeout(() => !me.dead && startFrames(me, me.cam, box), 1500); }
+  }
+  function startFrames(me, cam, box) {
     box.innerHTML = `<img alt="Ζωντανή εικόνα κάμερας" hidden><div class="live-msg empty">Σύνδεση με την κάμερα μέσω του κουτιού…</div><span class="live-tag">LIVE · ~1 καρέ/δευτ.</span>`;
     const img = $('img', box), msg = $('.live-msg', box);
     let n = 0, lastTs = null;
     const tick = async () => {
-      if (!live || document.hidden) return;
+      if (live !== me || document.hidden) return;
       n++;
       if (n % 5 === 1) {
         try {
@@ -79,13 +116,13 @@
         } catch (e) { msg.textContent = e.message; msg.hidden = false; return; }
       }
       const probe = new Image();
-      probe.onload = () => { if (!live || live.cam !== cam) return; img.src = probe.src; img.hidden = false; msg.hidden = true; };
+      probe.onload = () => { if (live !== me) return; img.src = probe.src; img.hidden = false; msg.hidden = true; };
       probe.onerror = () => { if (n > 12 && img.hidden) msg.textContent = 'Δεν έρχεται εικόνα. Ελέγξτε ότι το κουτί έχει την έκδοση 1.1 και πρόσβαση στην κάμερα.'; };
       probe.src = `/api/cameras/${cam}/frame?t=${Date.now()}`;
     };
-    live = { cam, timer: setInterval(tick, 1000) };
+    me.timer = setInterval(tick, 1000);
     tick();
-  };
+  }
 
   /* ================================================================ push notifications */
   const u8 = s => { s = s.replace(/-/g, '+').replace(/_/g, '/'); return Uint8Array.from(atob(s + '='.repeat((4 - s.length % 4) % 4)), c => c.charCodeAt(0)); };

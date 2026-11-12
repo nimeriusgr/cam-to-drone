@@ -493,6 +493,8 @@ class Handler(BaseHTTPRequestHandler):
             if inc["dock_options"] and inc["status"] != "closed" and not (inc["mission"] and inc["mission"]["phase"] != "landed"):
                 inc["preflight"] = features.preflight(tgt[0], tgt[1], inc["dock_options"])
             inc["police_summary"] = logic.police_summary(inc)
+            if inc["mission"] and not inc["mission"]["simulated"]:  # real Dock: it pushes its video to the media server
+                inc["mission"]["live_whep"] = features.media_play("dock", inc["mission"]["dock_id"])
             return self.send(200, inc)
         m = re.fullmatch(r"/api/incidents/(\d+)/action", path)
         if m and method == "POST":
@@ -611,7 +613,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, fr[1], fr[2])
             edge = db.q1("SELECT last_seen FROM edges WHERE id=?", (cam["edge_id"],))
             return self.send(200, {"ok": True, "frame_ts": fr[0] if fr else None, "server_time": time.time(),
-                                   "edge_online": bool(edge and edge["last_seen"] and time.time() - edge["last_seen"] < 120)})
+                                   "edge_online": bool(edge and edge["last_seen"] and time.time() - edge["last_seen"] < 120),
+                                   "whep": features.media_play("cam", cam["id"])})
 
         # admin
         m = re.fullmatch(r"/api/admin/(\w+)(?:/(\d+))?", path)
@@ -623,10 +626,19 @@ class Handler(BaseHTTPRequestHandler):
         u = self.user(roles={"admin", "supervisor"} if method == "GET" else {"admin"})
         if table == "settings":
             if method == "GET":
-                return self.send(200, {"flight": features.flight_limits(), "sms": db.setting("sms", {}), "smtp": {**(db.setting("smtp", {}) or {}), "password": "••••" if (db.setting("smtp", {}) or {}).get("password") else ""}})
+                media = features.media_cfg()
+                return self.send(200, {"flight": features.flight_limits(), "media": {"publish": media.get("publish", ""), "play": media.get("play", "")},
+                                       "sms": db.setting("sms", {}), "smtp": {**(db.setting("smtp", {}) or {}), "password": "••••" if (db.setting("smtp", {}) or {}).get("password") else ""}})
             b = self.json_body()
             if "sms" in b:
                 db.set_setting("sms", b["sms"])
+            if "media" in b:
+                old = features.media_cfg()
+                pub, play = str(b["media"].get("publish") or "").strip(), str(b["media"].get("play") or "").strip()
+                need(not pub or (pub.startswith(("rtsp://", "rtsps://", "rtmp://", "rtmps://", "srt://")) and "{path}" in pub), 400,
+                     "Η διεύθυνση αποστολής πρέπει να είναι rtsp/rtmp/srt και να περιέχει {path}")
+                need(not play or (play.startswith("https://") and "{path}" in play), 400, "Η διεύθυνση προβολής πρέπει να είναι https και να περιέχει {path}")
+                db.set_setting("media", {"publish": pub, "play": play, "secret": old.get("secret") or secrets.token_hex(16)})
             if "flight" in b:
                 try:
                     db.set_setting("flight", {k: float(b["flight"][k]) for k in features.FLIGHT_DEFAULTS if k in b["flight"]})

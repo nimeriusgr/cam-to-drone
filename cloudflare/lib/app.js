@@ -509,10 +509,20 @@ class App {
   // ---------------- edge boxes: commands, live frames, clips, self-update
   async edgePoll(edge) {
     const t = now();
-    const live = (await this.db.q('SELECT c.ext_key FROM live_req l JOIN cameras c ON c.id=l.camera_id WHERE c.edge_id=? AND l.until>?', [edge.id, t])).map(r => r.ext_key);
+    const cams = await this.db.q('SELECT c.id, c.ext_key FROM live_req l JOIN cameras c ON c.id=l.camera_id WHERE c.edge_id=? AND l.until>?', [edge.id, t]);
     const busy = await this.db.q1("SELECT 1 AS x FROM incidents WHERE org_id=? AND status!='closed' LIMIT 1", [edge.org_id]);
-    return { ok: true, server_time: t, fast: !!(busy || live.length), live, update: !!edge.update_requested, agent: { version: AGENT.version, sha256: AGENT.sha256 } };
+    const media = await this.mediaCfg(), streams = {};
+    // with a media server: the box streams video+audio there instead of sending snapshots
+    if (media.publish) for (const c of cams) streams[c.ext_key] = media.publish.split('{path}').join(await this.mediaPath('cam', c.id));
+    return { ok: true, server_time: t, fast: !!(busy || cams.length), live: cams.map(c => c.ext_key), streams, update: !!edge.update_requested, agent: { version: AGENT.version, sha256: AGENT.sha256 } };
   }
+  // live video + audio through a media server (same scheme as server/features.py)
+  async mediaCfg() { return await this.db.setting('media', {}) || {}; }
+  async mediaPath(kind, id) {
+    const m = await this.mediaCfg();
+    return `${kind}${id}_` + hex(await crypto.subtle.digest('SHA-256', te(`${m.secret || ''}:${kind}${id}`))).slice(0, 16);
+  }
+  async mediaPlay(kind, id) { const m = await this.mediaCfg(); return m.play && m.publish ? m.play.split('{path}').join(await this.mediaPath(kind, id)) : null; }
   async attachClip(edge, key, ts, data, ctype) {
     const cam = await this.db.q1('SELECT * FROM cameras WHERE org_id=? AND ext_key=?', [edge.org_id, key]); if (!cam) return null;
     const ev = await this.db.q1('SELECT * FROM events WHERE camera_id=? AND suppressed IS NULL AND incident_id IS NOT NULL AND ts BETWEEN ? AND ? ORDER BY ABS(ts-?) LIMIT 1', [cam.id, ts - 20, ts + 20, ts]);
@@ -739,6 +749,7 @@ class App {
       inc.dock_options = tg && u.role !== 'customer' ? await this.dockOptions(...tg) : [];
       if (inc.dock_options.length && inc.status !== 'closed' && !(inc.mission && inc.mission.phase !== 'landed')) inc.preflight = await this.preflight(tg[0], tg[1], inc.dock_options);
       inc.police_summary = this.policeSummary(inc);
+      if (inc.mission && !inc.mission.simulated) inc.mission.live_whep = await this.mediaPlay('dock', inc.mission.dock_id); // real Dock pushes its video there
       return json(inc);
     }
     // shifts
@@ -794,7 +805,7 @@ class App {
       const fr = await this.db.q1(`SELECT ts, ctype${m[2] === 'frame' ? ', data' : ''} FROM live_frames WHERE camera_id=?`, [cam.id]);
       if (m[2] === 'frame') { need(fr, 404, 'Δεν υπάρχει ακόμα εικόνα'); return new Response(b64d(fr.data), { headers: { 'Content-Type': fr.ctype, 'Cache-Control': 'no-store' } }); }
       const edge = await this.db.q1('SELECT last_seen FROM edges WHERE id=?', [cam.edge_id]);
-      return json({ ok: true, frame_ts: fr ? fr.ts : null, server_time: t, edge_online: !!(edge && edge.last_seen && t - edge.last_seen < 120) });
+      return json({ ok: true, frame_ts: fr ? fr.ts : null, server_time: t, edge_online: !!(edge && edge.last_seen && t - edge.last_seen < 120), whep: await this.mediaPlay('cam', cam.id) });
     }
     if ((m = p.match(/^\/api\/incidents\/(\d+)\/action$/)) && method === 'POST') return json(await this.action(+m[1], await this.user(), await this.body()));
     if ((m = p.match(/^\/api\/incidents\/(\d+)\/speaker-audio$/)) && method === 'POST') {
@@ -874,8 +885,14 @@ class App {
   async admin(method, table, id) {
     const u = await this.user(true, method === 'GET' ? ['admin', 'supervisor'] : ['admin']);
     if (table === 'settings') {
-      if (method === 'GET') { const em = await this.db.setting('email', {}) || {}; return json({ flight: await this.flightLimits(), sms: await this.db.setting('sms', {}), email: em, platform: 'cloudflare', r2: !!this.env.MEDIA }); }
+      if (method === 'GET') { const em = await this.db.setting('email', {}) || {}, md = await this.mediaCfg(); return json({ flight: await this.flightLimits(), media: { publish: md.publish || '', play: md.play || '' }, sms: await this.db.setting('sms', {}), email: em, platform: 'cloudflare', r2: !!this.env.MEDIA }); }
       const b = await this.body();
+      if (b.media) {
+        const old = await this.mediaCfg(), pub = String(b.media.publish || '').trim(), play = String(b.media.play || '').trim();
+        need(!pub || (/^(rtsps?|rtmps?|srt):\/\//.test(pub) && pub.includes('{path}')), 400, 'Η διεύθυνση αποστολής πρέπει να είναι rtsp/rtmp/srt και να περιέχει {path}');
+        need(!play || (play.startsWith('https://') && play.includes('{path}')), 400, 'Η διεύθυνση προβολής πρέπει να είναι https και να περιέχει {path}');
+        await this.db.setSetting('media', { publish: pub, play, secret: old.secret || hex(crypto.getRandomValues(new Uint8Array(16))) });
+      }
       if (b.flight) {
         const f = {}; for (const k of Object.keys(FLIGHT_DEFAULTS)) if (k in b.flight) { f[k] = Number(b.flight[k]); need(Number.isFinite(f[k]), 400, 'Τα όρια πτήσης πρέπει να είναι αριθμοί'); }
         await this.db.setSetting('flight', f);

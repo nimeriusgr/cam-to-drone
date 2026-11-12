@@ -251,7 +251,9 @@ function renderIncident() {
   renderMap();
 }
 
+function stopDroneVideo() { if (S.droneClose) { S.droneClose(); S.droneClose = null; } delete $('#droneView').dataset.whep; }
 function renderDrone(i, m, flying, cust) {
+  if (!(m && flying && m.live_whep)) stopDroneVideo();
   if (!m) {
     const d = (i.dock_options || []).find(x => x.available && x.in_range);
     $('#droneTitle').textContent = '';
@@ -264,12 +266,25 @@ function renderDrone(i, m, flying, cust) {
   $('#droneView').classList.remove('idle');
   $('#droneTitle').innerHTML = `${esc(m.dock.name)} ${m.simulated ? '<span class="tag">ΠΡΟΣΟΜΟΙΩΣΗ</span>' : ''}`;
   const dist = m.distance_m * (1 - m.progress);
-  $('#droneView').innerHTML = `<div class="sim-bg ${m.camera_mode === 'ir' ? 'ir' : ''}"></div>
-    <div class="hud"><div class="tl">${PHASE[m.phase]}${m.eta ? ` · άφιξη ${dur(m.eta)}` : ''}<br>ΥΨ ${m.alt} m · ${CAM_MODE[m.camera_mode]}${m.light ? ' · ΠΡΟΒΟΛΕΑΣ' : ''}</div>
+  const hud = `<div class="tl">${PHASE[m.phase]}${m.eta ? ` · άφιξη ${dur(m.eta)}` : ''}<br>ΥΨ ${m.alt} m · ${CAM_MODE[m.camera_mode]}${m.light ? ' · ΠΡΟΒΟΛΕΑΣ' : ''}</div>
       <div class="tr">ΜΠΑΤ ${m.battery}%<br>${dur(m.elapsed)}</div>
       <div class="bl">${m.lat.toFixed(5)}, ${m.lon.toFixed(5)}<br>απόσταση ${km(dist)}</div>
-      ${m.simulated ? '' : '<div class="br">LIVE</div>'}
-      ${flying ? '<div class="cross"></div>' : ''}</div>`;
+      ${flying ? '<div class="cross"></div>' : ''}`;
+  const dv = $('#droneView');
+  if (flying && m.live_whep && window.Features) {
+    // real Dock: the drone's camera and sound through the media server; the video element is kept between refreshes
+    if (dv.dataset.whep !== m.live_whep) {
+      stopDroneVideo(); dv.dataset.whep = m.live_whep;
+      dv.innerHTML = Features.videoHtml('Σύνδεση με την κάμερα του drone…') + '<div class="hud" id="droneHud"></div>';
+      Features.bindSound(dv);
+      const v = $('video', dv); v.onplaying = () => { const x = $('.live-msg', dv); if (x) x.hidden = true; };
+      Features.whep(m.live_whep, v).then(c => { if (dv.dataset.whep === m.live_whep) S.droneClose = c; else c(); })
+        .catch(() => { const x = $('.live-msg', dv); if (x) x.textContent = 'Δεν ήρθε βίντεο από το drone'; });
+    }
+    $('#droneHud').innerHTML = hud;
+  } else {
+    dv.innerHTML = `<div class="sim-bg ${m.camera_mode === 'ir' ? 'ir' : ''}"></div><div class="hud">${hud}${m.simulated ? '' : '<div class="br">LIVE</div>'}</div>`;
+  }
   $('#droneBar').innerHTML = cust || !flying ? `<span class="mut">${flying ? '' : 'Το drone προσγειώθηκε στο Dock'}</span>` : `
     ${['wide', 'zoom', 'ir'].map(k => `<button class="btn sm ${m.camera_mode === k ? 'on' : ''}" data-cam="${k}">${CAM_MODE[k]}</button>`).join('')}
     ${m.dock.has_light ? `<button class="btn sm ${m.light ? 'on' : ''}" data-a="light">Προβολέας</button>` : ''}

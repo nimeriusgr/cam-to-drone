@@ -177,7 +177,7 @@
 
   async function renderSettings(body, ro) {
     const s = await api('/api/admin/settings'), sms = s.sms || {}, smtp = s.smtp || {};
-    if (s.platform === 'cloudflare') { renderSettingsHttp(body, ro, sms, s.email || {}); return flightBox(body, ro, s.flight || {}); }
+    if (s.platform === 'cloudflare') { renderSettingsHttp(body, ro, sms, s.email || {}); flightBox(body, ro, s.flight || {}); return mediaBox(body, ro, s.media || {}); }
     body.innerHTML = `<div class="bar"><h2>Ειδοποιήσεις</h2></div>
       <p class="mut" style="max-width:75ch">Χωρίς πάροχο, τα SMS και τα email καταγράφονται ως «προσομοίωση» και δεν στέλνονται. Στην Ελλάδα το όνομα αποστολέα SMS χρειάζεται προεγγραφή στον πάροχο.</p>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px" class="modal-like">
@@ -206,6 +206,26 @@
       } catch (e) { toast(e.message.includes('JSON') ? 'Τα headers και το σώμα πρέπει να είναι έγκυρο JSON' : e.message, 'err'); }
     };
     flightBox(body, ro, s.flight || {});
+    mediaBox(body, ro, s.media || {});
+  }
+
+  // live video + audio: address of the media server (empty = off, the console shows ~1 frame per second)
+  function mediaBox(body, ro, m) {
+    const el = document.createElement('div');
+    el.innerHTML = `<div class="bar" style="margin-top:22px"><h2>Ζωντανό βίντεο με ήχο</h2></div>
+      <p class="mut" style="max-width:85ch">Χρειάζεται media server (π.χ. MediaMTX σε δικό σας server). Όσο κάποιος βλέπει «Ζωντανά», το κουτί στέλνει εκεί βίντεο και ήχο της κάμερας,
+        και ο browser το παίζει με WebRTC (καθυστέρηση περίπου 1″). Το ίδιο ισχύει για την κάμερα του drone όταν συνδεθεί πραγματικό Dock. Κενά πεδία: απενεργοποιημένο,
+        και εμφανίζεται μία εικόνα ανά δευτερόλεπτο. Το <code>{path}</code> αντικαθίσταται από μυστικό όνομα ανά κάμερα.</p>
+      <div class="pane" style="padding:14px;max-width:640px">
+        <label class="mut" for="mdP">Αποστολή από το κουτί (rtsp / rtmp / srt)</label><input id="mdP" class="in" value="${esc(m.publish || '')}" placeholder="rtsp://χρήστης:κωδικός@media.example.com:8554/{path}" ${ro ? 'disabled' : ''}>
+        <label class="mut" for="mdW">Προβολή στον browser (WHEP, https)</label><input id="mdW" class="in" value="${esc(m.play || '')}" placeholder="https://media.example.com:8889/{path}/whep" ${ro ? 'disabled' : ''}>
+      </div>${ro ? '' : '<div style="margin-top:12px"><button class="btn pri" id="mdSave">Αποθήκευση</button></div>'}`;
+    body.appendChild(el);
+    $$('.in', el).forEach(i => Object.assign(i.style, { width: '100%', background: 'var(--bg)', border: '1px solid var(--line2)', borderRadius: '8px', padding: '7px 9px', margin: '2px 0 8px' }));
+    if (ro) return;
+    $('#mdSave').onclick = async () => {
+      try { await api('/api/admin/settings', { media: { publish: $('#mdP').value.trim(), play: $('#mdW').value.trim() } }, 'PUT'); toast('Αποθηκεύτηκε'); } catch (e) { toast(e.message, 'err'); }
+    };
   }
 
   // pre-flight limits (both platforms)
