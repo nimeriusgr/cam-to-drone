@@ -12,7 +12,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "server"))
 os.environ.setdefault("C2D_DATA", os.path.join(HERE, ".seed-tmp"))
-from seed import DEMO, DOCKS, DEFAULT_SOP, DEFAULT_PRESETS, NIGHT  # noqa: E402
+from seed import DEMO, DOCKS, DEFAULT_SOP, DEFAULT_PRESETS, NIGHT, NOFLY, NOFLY_NOTE  # noqa: E402
 
 
 def h(pw):
@@ -57,6 +57,8 @@ for name, addr, lat, lon, cams, contacts in DEMO:
         sql.append(ins("contacts", {"org_id": oid, "name": cn, "role": role, "phone": phone, "email": mail, "priority": j + 1}))
 for name, lat, lon, r in DOCKS:
     sql.append(ins("docks", {"name": name, "lat": lat, "lon": lon, "radius_km": r, "adapter": "sim"}))
+for name, lat, lon, r, lvl in NOFLY:
+    sql.append(ins("nofly", {"name": name, "lat": lat, "lon": lon, "radius_m": r, "level": lvl, "notes": NOFLY_NOTE}))
 for username, name, role, org in [("admin", "Διαχειριστής", "admin", None), ("operator", "Ελεγκτής", "operator", None),
                                   ("pelatis", "Πελάτης Μάρκος ΑΕ", "customer", 2)]:
     pw, api = secrets.token_urlsafe(9), secrets.token_urlsafe(24)

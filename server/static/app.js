@@ -68,22 +68,29 @@ async function boot() {
   $('#login').hidden = true; $('#app').hidden = false;
   $('#avatar').textContent = S.me.name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
   $('#userName').textContent = `${S.me.name} · ${({ admin: 'Διαχειριστής', supervisor: 'Επόπτης', operator: 'Ελεγκτής', customer: 'Πελάτης' })[S.me.role]}`;
+  const cust = S.me.role === 'customer';
   $('#navAdmin').hidden = !['admin', 'supervisor'].includes(S.me.role);
-  $('#demoBtn').hidden = S.me.role === 'customer';
-  document.body.classList.toggle('customer', S.me.role === 'customer');
+  $('#demoBtn').hidden = cust;
+  $('#navConsole').hidden = cust; $('#navCust').hidden = !cust;
+  document.body.classList.toggle('customer', cust);
   S.cloud = S.me.platform === 'cloudflare';
-  initMap();
+  if (cust) showView('cust'); else initMap();
   await refresh();
   if (!S.cloud) connectStream();
+  if (window.Features) Features.boot();
 }
 
 /* ------------------------------------------------------------ navigation */
-$$('#nav button').forEach(b => b.onclick = () => {
-  $$('#nav button').forEach(x => x.classList.toggle('on', x === b));
-  const v = b.dataset.view;
-  $('#console').hidden = v !== 'console'; $('#admin').hidden = v !== 'admin';
-  if (v === 'admin') window.Admin && Admin.open(); else setTimeout(() => S.map && S.map.invalidateSize(), 50);
-});
+function showView(v) {
+  S.view = v;
+  $$('#nav button').forEach(x => x.classList.toggle('on', x.dataset.view === v));
+  for (const k of ['console', 'admin', 'reports', 'cust']) $('#' + k).hidden = v !== k;
+  if (v === 'admin') window.Admin && Admin.open();
+  else if (v === 'reports') window.Features && Features.openReports();
+  else if (v === 'cust') window.Features && Features.renderCustomer();
+  else setTimeout(() => S.map && S.map.invalidateSize(), 50);
+}
+$$('#nav button').forEach(b => b.onclick = () => showView(b.dataset.view));
 $('#demoBtn').onclick = async () => { try { const r = await api('/api/demo/alarm', {}); if (r.suppressed) toast('Ο συναγερμός φιλτραρίστηκε: ' + r.suppressed); } catch (e) { toast(e.message, 'err'); } };
 
 /* ------------------------------------------------------------ data refresh */
@@ -100,15 +107,18 @@ async function refresh() {
     if (!S.sel) select(fresh[0].id);
   }
   renderStats(); renderOrgFilter(); renderQueue(fresh.map(i => i.id)); renderMap();
+  if (window.Features) Features.afterRefresh(fresh);
+  if (S.me.role === 'customer') return;
   if (S.sel) await loadIncident(); else renderIdle();
 }
 async function loadIncident() {
-  if (!S.sel) return;
+  if (!S.sel || S.me.role === 'customer') return;
   try { S.inc = await api(`/api/incidents/${S.sel}`); }
   catch { S.sel = null; S.inc = null; renderIdle(); return; }
   renderIncident();
 }
 function select(id) {
+  if (S.sel !== id && window.Features) Features.stopLive();
   S.sel = id; S.imgSel = null; S.fitted = false;
   $$('.q-item').forEach(x => x.classList.toggle('sel', +x.dataset.id === id));
   loadIncident().then(renderMap);
@@ -167,9 +177,10 @@ function renderOrgFilter() {
 function renderQueue(flash) {
   let list = S.ov.incidents;
   if (S.org) list = list.filter(i => i.org_id === +S.org);
-  const counts = { open: list.filter(i => i.status !== 'closed').length, high: list.filter(i => i.status !== 'closed' && i.priority === 1).length, drone: list.filter(i => i.flying).length, closed: list.filter(i => i.status === 'closed').length };
+  const mine = i => i.status !== 'closed' && i.assigned_user === S.me.id;
+  const counts = { open: list.filter(i => i.status !== 'closed').length, high: list.filter(i => i.status !== 'closed' && i.priority === 1).length, mine: list.filter(mine).length, drone: list.filter(i => i.flying).length, closed: list.filter(i => i.status === 'closed').length };
   $$('#qFilters .chip').forEach(c => { c.innerHTML = c.textContent.replace(/\d+$/, '').trim() + `<span class="n">${counts[c.dataset.f]}</span>`; });
-  list = list.filter(i => S.filter === 'closed' ? i.status === 'closed' : i.status !== 'closed' && (S.filter !== 'high' || i.priority === 1) && (S.filter !== 'drone' || i.flying));
+  list = list.filter(i => S.filter === 'closed' ? i.status === 'closed' : S.filter === 'mine' ? mine(i) : i.status !== 'closed' && (S.filter !== 'high' || i.priority === 1) && (S.filter !== 'drone' || i.flying));
   $('#queue').innerHTML = list.map(i => `
     <button class="q-item p${i.priority} ${i.status === 'new' ? 'new' : ''} ${i.id === S.sel ? 'sel' : ''} ${flash.includes(i.id) ? 'flash' : ''}" data-id="${i.id}">
       <span class="bar"></span>
@@ -189,6 +200,7 @@ function renderIdle() {
   $('#camView').innerHTML = '<div class="empty">Επιλέξτε περιστατικό από τη λίστα</div>'; $('#camThumbs').innerHTML = '';
   const flying = S.ov ? S.ov.missions : [];
   $('#droneView').innerHTML = `<div class="empty">${flying.length ? `${flying.length} drone σε αποστολή` : 'Κανένα drone σε αποστολή'}</div>`; $('#droneBar').innerHTML = '';
+  $('#droneView').classList.add('idle');
   if (!S.ov) return;
   const custs = S.ov.orgs.filter(o => o.kind === 'customer');
   $('#side').innerHTML = `
@@ -205,11 +217,28 @@ function renderIncident() {
   const i = S.inc, m = i.mission, flying = m && m.phase !== 'landed', closed = i.status === 'closed', cust = S.me.role === 'customer';
   // camera
   $('#camTitle').textContent = `${i.camera ? i.camera.name : ''} · ${hms(i.first_ts)}`;
-  const img = S.imgSel && i.images.includes(S.imgSel) ? S.imgSel : i.images[i.images.length - 1];
-  const camHtml = img ? `<img src="/media/${encodeURIComponent(img)}" alt="Εικόνα συναγερμού">` : '<div class="empty">Η κάμερα δεν έστειλε εικόνα</div>';
-  if ($('#camView').dataset.img !== (img || '')) { $('#camView').innerHTML = camHtml; $('#camView').dataset.img = img || ''; }
-  const th = i.images.length > 1 ? i.images.map(n => `<img src="/media/${encodeURIComponent(n)}" data-n="${esc(n)}" class="${n === img ? 'on' : ''}" alt="">`).join('') : `<span class="mut">${i.count} σήμα${i.count > 1 ? 'τα' : ''} · ${i.camera_list.map(c => esc(c.name)).join(', ')}</span>`;
-  if ($('#camThumbs').dataset.h !== th) { $('#camThumbs').innerHTML = th; $('#camThumbs').dataset.h = th; $$('#camThumbs img').forEach(t => t.onclick = () => { S.imgSel = t.dataset.n; renderIncident(); }); }
+  const clips = i.clips || [], liveCams = i.camera_list.filter(c => c.edge_id);
+  const live = window.Features && Features.liveCam();
+  const clipSel = S.imgSel && S.imgSel.startsWith('clip:') && clips.find(c => 'clip:' + c.name === S.imgSel);
+  const img = clipSel ? null : S.imgSel && i.images.includes(S.imgSel) ? S.imgSel : i.images[i.images.length - 1];
+  const key = live ? 'live:' + live : clipSel ? S.imgSel : img || '';
+  if (!live && $('#camView').dataset.img !== key) {
+    $('#camView').innerHTML = clipSel ? `<video src="/media/${encodeURIComponent(clipSel.name)}" controls autoplay muted playsinline></video>`
+      : img ? `<img src="/media/${encodeURIComponent(img)}" alt="Εικόνα συναγερμού">` : '<div class="empty">Η κάμερα δεν έστειλε εικόνα</div>';
+    $('#camView').dataset.img = key;
+  }
+  const th = (i.images.length > 1 ? i.images.map(n => `<img src="/media/${encodeURIComponent(n)}" data-n="${esc(n)}" class="${!live && n === img ? 'on' : ''}" alt="">`).join('') : '')
+    + clips.map(c => `<button class="clipbtn ${!live && 'clip:' + c.name === S.imgSel ? 'on' : ''}" data-n="clip:${esc(c.name)}" title="${esc(c.camera || '')}">▶ ${hm(c.ts)}</button>`).join('')
+    + (i.images.length > 1 || clips.length ? '' : `<span class="mut">${i.count} σήμα${i.count > 1 ? 'τα' : ''} · ${i.camera_list.map(c => esc(c.name)).join(', ')}</span>`)
+    + (liveCams.length ? `<span class="sp"></span>${liveCams.length > 1 ? `<select id="liveCam" aria-label="Κάμερα για ζωντανή εικόνα">${liveCams.map(c => `<option value="${c.id}" ${live === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>` : ''}
+       <button class="btn sm ${live ? 'on' : ''}" id="liveBtn">${live ? 'Τέλος ζωντανής' : 'Ζωντανά'}</button>` : '');
+  if ($('#camThumbs').dataset.h !== th) {
+    $('#camThumbs').innerHTML = th; $('#camThumbs').dataset.h = th;
+    $$('#camThumbs [data-n]').forEach(t => t.onclick = () => { window.Features && Features.stopLive(); S.imgSel = t.dataset.n; renderIncident(); });
+    const lb = $('#liveBtn');
+    if (lb) lb.onclick = () => { if (Features.liveCam()) { Features.stopLive(); $('#camView').dataset.img = ''; } else Features.startLive(+($('#liveCam') ? $('#liveCam').value : liveCams[0].id), $('#camView')); renderIncident(); };
+    const ls = $('#liveCam'); if (ls) ls.onchange = () => { if (Features.liveCam()) { Features.startLive(+ls.value, $('#camView')); } };
+  }
   // drone
   renderDrone(i, m, flying, cust);
   // side
@@ -222,11 +251,13 @@ function renderDrone(i, m, flying, cust) {
   if (!m) {
     const d = (i.dock_options || []).find(x => x.available && x.in_range);
     $('#droneTitle').textContent = '';
+    $('#droneView').classList.add('idle');
     $('#droneView').innerHTML = `<div class="empty">${d ? `Πλησιέστερο διαθέσιμο: <b>${esc(d.name)}</b><br>${km(d.distance_m)} · άφιξη σε ~${dur(d.eta_s)}` : 'Δεν υπάρχει διαθέσιμο drone εντός εμβέλειας'}</div>`;
     $('#droneBar').innerHTML = cust || i.status === 'closed' ? '' : `<button class="btn pri" data-a="dispatch" ${d ? '' : 'disabled'}>Αποστολή drone</button>`;
     $$('#droneBar [data-a]').forEach(b => b.onclick = () => act(b.dataset.a));
     return;
   }
+  $('#droneView').classList.remove('idle');
   $('#droneTitle').innerHTML = `${esc(m.dock.name)} ${m.simulated ? '<span class="tag">ΠΡΟΣΟΜΟΙΩΣΗ</span>' : ''}`;
   const dist = m.distance_m * (1 - m.progress);
   $('#droneView').innerHTML = `<div class="sim-bg ${m.camera_mode === 'ir' ? 'ir' : ''}"></div>
@@ -252,7 +283,7 @@ function sideHtml(i, m, flying, closed, cust) {
       <div class="row"><span class="pill ${i.status}">${STATUS[i.status]}</span><span class="pill">${PRIO[i.priority]} προτεραιότητα</span>
         ${i.escalated ? '<span class="pill esc">ΚΛΙΜΑΚΩΣΗ</span>' : ''}
         <span class="mut">${closed ? 'έκλεισε ' + hm(i.closed_ts) : `πριν <span class="timer" data-age="${i.first_ts}">${dur(i.age)}</span>`}</span></div>
-      <div class="mut">#${i.id} · ${i.assigned_name ? 'Ελεγκτής: ' + esc(i.assigned_name) : 'Χωρίς ανάληψη'}</div>
+      ${cust || closed ? `<div class="mut">#${i.id} · ${i.assigned_name ? 'Ελεγκτής: ' + esc(i.assigned_name) : 'Χωρίς ανάληψη'}</div>` : assignHtml(i)}
     </div>`;
   const info = `<div class="sec"><h3>Στοιχεία</h3><dl class="kv">
       <dt>Διεύθυνση</dt><dd>${esc(org.address || '—')}</dd>
@@ -291,7 +322,15 @@ function sideHtml(i, m, flying, closed, cust) {
   return head + actions + speaker + sop + notif + info + tl;
 }
 
+function assignHtml(i) {
+  const people = new Map((S.ov.on_duty || []).map(d => [d.id, `${d.name} · σε βάρδια${d.open_n ? ` (${d.open_n})` : ''}`]));
+  if (!people.has(S.me.id)) people.set(S.me.id, `${S.me.name} (εγώ)`);
+  if (i.assigned_user && !people.has(i.assigned_user)) people.set(i.assigned_user, `${i.assigned_name || '#' + i.assigned_user} · εκτός βάρδιας`);
+  return `<div class="assign"><span class="mut">#${i.id} · Ελεγκτής</span><select id="asSel" aria-label="Ανάθεση σε ελεγκτή"><option value="">— χωρίς ανάθεση —</option>
+    ${[...people].map(([id, n]) => `<option value="${id}" ${i.assigned_user === id ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select></div>`;
+}
 function bindSide(i, m) {
+  const as = $('#asSel'); if (as) as.onchange = () => send({ action: 'assign', user_id: as.value ? +as.value : null }, as.value ? 'Έγινε ανάθεση' : 'Έγινε αποδέσμευση');
   $$('#side [data-a]').forEach(b => b.onclick = () => act(b.dataset.a));
   $$('#side [data-sop]').forEach(c => c.onchange = () => send({ action: 'sop', step: +c.dataset.sop, done: c.checked }));
   $$('#side [data-preset]').forEach(b => b.onclick = () => send({ action: 'speaker_tts', text: i.org.speaker_presets[+b.dataset.preset] }, 'Εκφωνήθηκε από το μεγάφωνο'));
@@ -354,15 +393,40 @@ function act(a) {
       <label for="clN">Σημείωση</label><textarea id="clN" placeholder="Τι βρέθηκε, ποιος ενημερώθηκε"></textarea>`,
     'Κλείσιμο', () => send({ action: 'close', outcome: $('input[name=oc]:checked').value, note: $('#clN').value }, 'Το περιστατικό έκλεισε'));
 }
+const CHECK = { ok: ['ok', 'Έλεγχος OK'], warn: ['warn', 'Προσοχή'], block: ['block', 'Απαγορεύεται'] };
+function weatherLine(w) {
+  if (!w) return '<span class="mut">Δεν υπάρχουν δεδομένα καιρού</span>';
+  const n = v => v == null ? '—' : (+v).toFixed(1);
+  return `${esc(w.desc || 'Καιρός')} · άνεμος <b>${n(w.wind)}</b> m/s · ριπές <b>${n(w.gust)}</b> m/s · βροχή ${n(w.precip)} mm · ${w.temp == null ? '—' : Math.round(w.temp)}°C <span class="mut">· ${esc(w.source || '')}</span>`;
+}
 function dispatchModal() {
-  const i = S.inc, opts = i.dock_options || [];
-  const best = opts.find(d => d.available && d.in_range);
+  const i = S.inc, opts = i.dock_options || [], pf = i.preflight || {};
+  const usable = d => d.available && d.in_range;
+  const best = opts.find(d => usable(d) && (!d.check || d.check.level !== 'block')) || opts.find(usable);
+  const canOverride = ['admin', 'supervisor'].includes(S.me.role);
   modal(`<h2>Αποστολή drone</h2><p class="mut">${esc(i.org.name)} · ${esc(i.camera ? i.camera.name : '')}</p>
-    ${opts.map(d => { const ok = d.available && d.in_range; return `<label class="dockopt ${ok ? '' : 'dis'}"><input type="radio" name="dk" value="${d.id}" ${d === best ? 'checked' : ''} ${ok ? '' : 'disabled'}>
-      <span><b>${esc(d.name)}</b><div class="mut">${km(d.distance_m)} · άφιξη ~${dur(d.eta_s)} · ${d.adapter === 'sim' ? 'προσομοίωση' : 'DJI Dock'}</div></span>
-      <span class="mut">${!d.available ? 'σε αποστολή' : !d.in_range ? 'εκτός εμβέλειας' : 'διαθέσιμο'}</span></label>`; }).join('') || '<p>Δεν υπάρχουν σταθμοί drone.</p>'}
+    <div class="wx">${weatherLine(pf.weather)}</div>
+    ${opts.map(d => { const ok = usable(d), c = d.check || { level: 'ok', issues: [] }; return `<label class="dockopt ${ok ? '' : 'dis'}"><input type="radio" name="dk" value="${d.id}" ${d === best ? 'checked' : ''} ${ok ? '' : 'disabled'}>
+      <span><b>${esc(d.name)}</b><div class="mut">${km(d.distance_m)} · άφιξη ~${dur(d.eta_s)} · ${d.adapter === 'sim' ? 'προσομοίωση' : 'DJI Dock'}</div>
+        ${ok && c.issues.length ? `<ul class="issues">${c.issues.map(x => `<li class="${x.level}">${esc(x.text)}</li>`).join('')}</ul>` : ''}</span>
+      <span class="r">${ok ? `<span class="chk ${CHECK[c.level][0]}">${CHECK[c.level][1]}</span>` : `<span class="mut">${!d.available ? 'σε αποστολή' : 'εκτός εμβέλειας'}</span>`}</span></label>`; }).join('') || '<p>Δεν υπάρχουν σταθμοί drone.</p>'}
+    <div id="ovr" hidden>${canOverride ? `<label class="check"><input type="checkbox" id="ovrOk"> Παράκαμψη του ελέγχου πτήσης με δική μου ευθύνη</label>
+      <label for="ovrWhy">Αιτιολογία (καταγράφεται στο χρονολόγιο)</label><input id="ovrWhy" placeholder="π.χ. επιβεβαιωμένη εισβολή, άδεια ΥΠΑ για τη ζώνη">`
+      : '<p class="err">Ο έλεγχος πτήσης δεν επιτρέπει την αποστολή. Μόνο επόπτης ή διαχειριστής μπορεί να τον παρακάμψει.</p>'}</div>
     <p class="mut">Ο ελεγκτής είναι υπεύθυνος για την πτήση. Βεβαιωθείτε ότι επιτρέπεται από την άδεια πτήσεων.</p>`,
-    'Επιβεβαίωση αποστολής', () => { const v = $('input[name=dk]:checked'); if (!v) throw new Error('Επιλέξτε σταθμό'); return send({ action: 'dispatch', dock_id: +v.value }, 'Το drone απογειώνεται'); }, !best);
+    'Επιβεβαίωση αποστολής', () => {
+      const v = $('input[name=dk]:checked'); if (!v) throw new Error('Επιλέξτε σταθμό');
+      const d = opts.find(x => x.id === +v.value), blocked = d.check && d.check.level === 'block';
+      const body = { action: 'dispatch', dock_id: d.id };
+      if (blocked) {
+        if (!canOverride) throw new Error('Μόνο επόπτης ή διαχειριστής μπορεί να παρακάμψει τον έλεγχο πτήσης');
+        if (!$('#ovrOk').checked) throw new Error('Επιβεβαιώστε την παράκαμψη του ελέγχου');
+        Object.assign(body, { override: true, override_reason: $('#ovrWhy').value.trim() });
+      }
+      return send(body, 'Το drone απογειώνεται');
+    }, !best);
+  const sync = () => { const v = $('input[name=dk]:checked'), d = v && opts.find(x => x.id === +v.value); $('#ovr').hidden = !(d && d.check && d.check.level === 'block'); };
+  $$('input[name=dk]').forEach(r => r.onchange = sync); sync();
 }
 function notifyModal(channel, ids) {
   const i = S.inc;
@@ -421,7 +485,7 @@ function initMap() {
   S.map = L.map('map', { zoomControl: true, attributionControl: true }).setView([37.98, 23.73], 10);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(S.map);
   S.layers.base = L.layerGroup().addTo(S.map); S.layers.live = L.layerGroup().addTo(S.map);
-  $('#legend').innerHTML = '<span><i class="mk alarm" style="box-shadow:none"></i>Συναγερμός</span><span><i class="mk ok"></i>Οπλισμένη</span><span><i class="mk off"></i>Αφόπλιστη</span><span><i class="mk-dock"></i>Dock</span><span><i class="mk-drone" style="width:12px;height:12px;border-width:3px"></i>Drone</span>';
+  $('#legend').innerHTML = '<span><i class="mk alarm" style="box-shadow:none"></i>Συναγερμός</span><span><i class="mk ok"></i>Οπλισμένη</span><span><i class="mk off"></i>Αφόπλιστη</span><span><i class="mk-dock"></i>Dock</span><span><i class="mk-drone" style="width:12px;height:12px;border-width:3px"></i>Drone</span><span><i class="mk-zone"></i>Ζώνη απαγόρευσης</span>';
 }
 const icon = (cls, size = 14) => L.divIcon({ className: '', html: `<div class="${cls}"></div>`, iconSize: [size, size], iconAnchor: [size / 2, size / 2] });
 function renderMap() {
@@ -434,6 +498,8 @@ function renderMap() {
     L.marker([o.lat, o.lon], { icon: icon(cls), zIndexOffset: alarmOrgs.has(o.id) ? 500 : 0 }).bindPopup(`<b>${esc(o.name)}</b><br>${esc(o.address)}<br>${o.armed ? 'Οπλισμένη' : 'Αφόπλιστη'} · ${o.cams_online}/${o.cams_total} κάμερες`).addTo(S.layers.base);
     pts.push([o.lat, o.lon]);
   });
+  (S.ov.nofly || []).forEach(z => L.circle([z.lat, z.lon], { radius: z.radius_m, color: z.level === 'block' ? '#ef4444' : '#f59e0b', weight: 1, dashArray: '4 5', opacity: .55, fillOpacity: .06 })
+    .bindTooltip(`${esc(z.name)} · ${z.level === 'block' ? 'απαγόρευση' : 'προσοχή'}`).addTo(S.layers.base));
   S.ov.docks.forEach(d => {
     L.circle([d.lat, d.lon], { radius: d.radius_km * 1000, color: '#60a5fa', weight: 1, opacity: .35, fillOpacity: .04 }).addTo(S.layers.base);
     L.marker([d.lat, d.lon], { icon: icon('mk-dock' + (d.busy ? ' busy' : ''), 16) }).bindPopup(`<b>${esc(d.name)}</b><br>${d.busy ? 'σε αποστολή' : 'διαθέσιμο'}`).addTo(S.layers.base);

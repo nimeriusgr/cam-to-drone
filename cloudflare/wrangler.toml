@@ -9,3 +9,8 @@ SIM_SPEED = "1"
 binding = "DB"
 database_name = "cam2drone"
 database_id = "145220d2-62a0-4d10-935e-a34ffb53a55c"
+
+# media (images, voice messages, alarm clips). Without this binding images go into D1 and clips are disabled.
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "cam2drone-media"

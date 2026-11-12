@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS contacts(
   notify_sms INTEGER DEFAULT 1, notify_email INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS edges(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, token TEXT UNIQUE NOT NULL,
-  last_seen REAL, version TEXT DEFAULT '', ip TEXT DEFAULT '');
+  last_seen REAL, version TEXT DEFAULT '', ip TEXT DEFAULT '', update_requested INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS cameras(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, edge_id INTEGER, ext_key TEXT NOT NULL,
   name TEXT NOT NULL, lat REAL, lon REAL, enabled INTEGER DEFAULT 1, snooze_until REAL,
@@ -31,19 +31,31 @@ CREATE TABLE IF NOT EXISTS incidents(
   escalated INTEGER DEFAULT 0, outcome TEXT, note TEXT DEFAULT '', closed_ts REAL, sop_done TEXT DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY, ts REAL NOT NULL, org_id INTEGER, camera_id INTEGER, incident_id INTEGER,
-  type TEXT, raw_type TEXT, target TEXT, state TEXT, image TEXT, raw TEXT, source TEXT, suppressed TEXT);
+  type TEXT, raw_type TEXT, target TEXT, state TEXT, image TEXT, raw TEXT, source TEXT, suppressed TEXT, clip TEXT);
 CREATE TABLE IF NOT EXISTS timeline(
   id INTEGER PRIMARY KEY, incident_id INTEGER NOT NULL, ts REAL NOT NULL, who TEXT, kind TEXT, text TEXT);
 CREATE TABLE IF NOT EXISTS missions(
   id INTEGER PRIMARY KEY, incident_id INTEGER NOT NULL, dock_id INTEGER NOT NULL, start_ts REAL NOT NULL,
   tlat REAL, tlon REAL, distance_m REAL, return_ts REAL, p_ret REAL DEFAULT 0, landed_ts REAL,
-  last_phase TEXT DEFAULT 'takeoff', light INTEGER DEFAULT 0, camera_mode TEXT DEFAULT 'wide');
+  last_phase TEXT DEFAULT 'takeoff', light INTEGER DEFAULT 0, camera_mode TEXT DEFAULT 'wide', onsite_ts REAL);
 CREATE TABLE IF NOT EXISTS notifications(
   id INTEGER PRIMARY KEY, incident_id INTEGER, ts REAL NOT NULL, channel TEXT, target TEXT,
   message TEXT, status TEXT, error TEXT, who TEXT);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts REAL NOT NULL, who TEXT, action TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS media(name TEXT PRIMARY KEY, ctype TEXT NOT NULL, data TEXT NOT NULL, ts REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS shifts(
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, start_ts REAL NOT NULL, end_ts REAL, handover TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS nofly(
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL, radius_m REAL NOT NULL DEFAULT 1000,
+  level TEXT DEFAULT 'block', notes TEXT DEFAULT '', enabled INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS push_subs(
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, endpoint TEXT UNIQUE NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, ts REAL);
+CREATE TABLE IF NOT EXISTS live_req(camera_id INTEGER PRIMARY KEY, until REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS live_frames(camera_id INTEGER PRIMARY KEY, ts REAL NOT NULL, ctype TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_inc_first ON incidents(first_ts);
+CREATE INDEX IF NOT EXISTS ix_ev_cam ON events(camera_id, ts);
+CREATE INDEX IF NOT EXISTS ix_shift_open ON shifts(end_ts);
 CREATE INDEX IF NOT EXISTS ix_inc_status ON incidents(status, last_ts);
 CREATE INDEX IF NOT EXISTS ix_inc_closed ON incidents(closed_ts);
 CREATE INDEX IF NOT EXISTS ix_ev_ts ON events(ts);

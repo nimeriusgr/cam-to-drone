@@ -52,7 +52,9 @@
     edges: {
       title: 'Κουτιά (Raspberry / Linux)', table: 'edges', add: 'Νέο κουτί',
       cols: [['Επιχείρηση', r => esc(orgName(r.org_id))], ['Όνομα', r => `<b>${esc(r.name)}</b>`], ['Κατάσταση', r => `<span class="dot ${r.last_seen && Date.now() / 1000 - r.last_seen < 120 ? '' : 'red'}" style="display:inline-block"></span> ${ago(r.last_seen)}`],
-        ['Έκδοση / IP', r => `${esc(r.version || '—')}<div class="mut">${esc(r.ip || '')}</div>`], ['Κάμερες', r => r.cameras], ['Token', r => `<code>${esc(r.token)}</code> <button class="btn sm" data-regen="${r.id}">Νέο token</button>`]],
+        ['Έκδοση / IP', r => `${esc(r.version || '—')}${r.version && r.agent_latest && r.version !== r.agent_latest ? ` <span class="pill ack">νέα: ${esc(r.agent_latest)}</span>` : ''}${r.update_requested ? ' <span class="pill dispatched">ενημέρωση σε αναμονή</span>' : ''}<div class="mut">${esc(r.ip || '')}</div>`],
+        ['Κάμερες', r => r.cameras], ['Token', r => `<code>${esc(r.token)}</code> <button class="btn sm" data-regen="${r.id}">Νέο token</button>`],
+        ['', r => S.me.role === 'admin' ? `<button class="btn sm" data-upd="${r.id}" title="Το κουτί κατεβάζει την έκδοση ${esc(r.agent_latest || '')} στην επόμενη επικοινωνία">Ενημέρωση</button>` : '']],
       fields: () => [['org_id', 'Επιχείρηση', 'select', { options: orgOptions(false), required: true }], ['name', 'Όνομα', 'text', { required: true }]],
       created: r => showSecret('Token κουτιού', r.token, 'Βάλτε το στο config.json του κουτιού (πεδίο "token"). Δεν θα ξαναεμφανιστεί.'),
     },
@@ -63,6 +65,15 @@
       fields: () => [['name', 'Όνομα', 'text', { required: true }], ['lat', 'Γεωγρ. πλάτος', 'number', { required: true }], ['lon', 'Γεωγρ. μήκος', 'number', { required: true }],
         ['radius_km', 'Ακτίνα κάλυψης (km)', 'number'], ['adapter', 'Σύνδεση', 'select', { options: { sim: 'Προσομοίωση', dji: 'DJI Cloud API (πραγματικό Dock)' } }], ['serial', 'Σειριακός αριθμός Dock', 'text'],
         ['has_speaker', 'Έχει μεγάφωνο (AS1)', 'check'], ['has_light', 'Έχει προβολέα (AL1)', 'check'], ['enabled', 'Ενεργός', 'check']],
+    },
+    nofly: {
+      title: 'Ζώνες απαγόρευσης πτήσης', table: 'nofly', add: 'Νέα ζώνη',
+      intro: 'Πριν από κάθε αποστολή drone ελέγχεται αν ο στόχος ή η διαδρομή από τον σταθμό περνά από ενεργή ζώνη. «Απαγόρευση»: η αποστολή μπλοκάρεται και μόνο επόπτης μπορεί να την παρακάμψει με αιτιολογία. «Προσοχή»: εμφανίζεται προειδοποίηση. Οι επίσημες ζώνες UAS δημοσιεύονται από την ΥΠΑ.',
+      cols: [['Ζώνη', r => `<b>${esc(r.name)}</b><div class="mut">${esc(r.notes || '')}</div>`], ['Κέντρο', r => `${(+r.lat).toFixed(5)}, ${(+r.lon).toFixed(5)}`], ['Ακτίνα', r => (r.radius_m >= 1000 ? (r.radius_m / 1000).toFixed(1) + ' km' : r.radius_m + ' m')],
+        ['Επίπεδο', r => r.level === 'block' ? '<span class="pill new">Απαγόρευση</span>' : '<span class="pill ack">Προσοχή</span>'], ['Ενεργή', r => r.enabled ? 'Ναι' : 'Όχι']],
+      fields: () => [['name', 'Όνομα', 'text', { required: true }], ['lat', 'Γεωγρ. πλάτος κέντρου', 'number', { required: true }], ['lon', 'Γεωγρ. μήκος κέντρου', 'number', { required: true }],
+        ['radius_m', 'Ακτίνα (μέτρα)', 'number', { required: true }], ['level', 'Επίπεδο', 'select', { options: { block: 'Απαγόρευση (μπλοκάρει την αποστολή)', warn: 'Προσοχή (μόνο προειδοποίηση)' } }],
+        ['notes', 'Σημειώσεις', 'textarea'], ['enabled', 'Ενεργή', 'check']],
     },
     users: {
       title: 'Χρήστες', table: 'users', add: 'Νέος χρήστης',
@@ -75,7 +86,7 @@
       created: r => showSecret('API token χρήστη', r.api_token, 'Για Postman: header Authorization: Bearer <token>. Δεν θα ξαναεμφανιστεί.'),
     },
   };
-  const NAV = [['orgs', 'Οργανισμοί'], ['contacts', 'Επαφές'], ['cameras', 'Κάμερες'], ['edges', 'Κουτιά'], ['docks', 'Σταθμοί drone'], ['users', 'Χρήστες'],
+  const NAV = [['orgs', 'Οργανισμοί'], ['contacts', 'Επαφές'], ['cameras', 'Κάμερες'], ['edges', 'Κουτιά'], ['docks', 'Σταθμοί drone'], ['nofly', 'Ζώνες πτήσης'], ['users', 'Χρήστες'],
     ['settings', 'Ειδοποιήσεις (SMS / Email)'], ['events', 'Καταγραφή σημάτων'], ['audit', 'Ιστορικό ενεργειών']];
 
   const orgName = id => (cache.orgs || []).find(o => o.id === id)?.name || '';
@@ -105,6 +116,7 @@
       if (page === 'audit') return renderLog(body, 'audit');
       const p = PAGES[page], rows = page === 'orgs' || page === 'edges' ? cache[page] : await load(p.table);
       body.innerHTML = `<div class="bar"><h2>${p.title}</h2><span class="mut">${rows.length}</span><span class="sp"></span>${ro ? '<span class="mut">μόνο προβολή</span>' : `<button class="btn pri" id="aAdd">${p.add}</button>`}</div>
+        ${p.intro ? `<p class="mut" style="max-width:90ch;margin-top:-4px">${p.intro}</p>` : ''}
         <table><thead><tr>${p.cols.map(c => `<th>${c[0]}</th>`).join('')}${ro ? '' : '<th></th>'}</tr></thead>
         <tbody>${rows.map(r => `<tr>${p.cols.map(c => `<td>${c[1](r)}</td>`).join('')}${ro ? '' : `<td style="white-space:nowrap"><button class="btn sm" data-edit="${r.id}">Επεξεργασία</button> <button class="btn sm" data-del="${r.id}">Διαγραφή</button></td>`}</tr>`).join('')
         || `<tr><td colspan="9" class="mut">Δεν υπάρχουν εγγραφές.</td></tr>`}</tbody></table>`;
@@ -112,6 +124,9 @@
       $('#aAdd').onclick = () => form(p, null);
       $$('[data-edit]', body).forEach(b => b.onclick = () => form(p, rows.find(r => r.id === +b.dataset.edit)));
       $$('[data-del]', body).forEach(b => b.onclick = () => modal(`<h2>Διαγραφή;</h2><p>Η εγγραφή θα διαγραφεί οριστικά.</p>`, 'Διαγραφή', async () => { await api(`/api/admin/${p.table}/${b.dataset.del}`, undefined, 'DELETE'); toast('Διαγράφηκε'); render(); }));
+      $$('[data-upd]', body).forEach(b => b.onclick = () => modal(`<h2>Ενημέρωση κουτιού;</h2><p>Το κουτί θα κατεβάσει τη νέα έκδοση του προγράμματος από τον server στην επόμενη επικοινωνία (έως 30″), θα ελέγξει ότι ξεκινά σωστά και θα επανεκκινηθεί. Οι ρυθμίσεις του (config.json) δεν αλλάζουν.</p>`, 'Ενημέρωση', async () => {
+        await api(`/api/admin/edges/${b.dataset.upd}`, { request_update: true }, 'PUT'); toast('Η ενημέρωση ζητήθηκε'); render();
+      }));
       $$('[data-regen]', body).forEach(b => b.onclick = () => modal(`<h2>Νέο token κουτιού;</h2><p>Το παλιό token σταματά να δουλεύει αμέσως. Θα χρειαστεί να βάλετε το νέο στο κουτί.</p>`, 'Δημιουργία', async () => {
         const r = await api(`/api/admin/edges/${b.dataset.regen}`, { regenerate_token: true }, 'PUT'); showSecret('Νέο token κουτιού', r.token, 'Βάλτε το στο config.json του κουτιού.'); render();
       }));
@@ -162,7 +177,7 @@
 
   async function renderSettings(body, ro) {
     const s = await api('/api/admin/settings'), sms = s.sms || {}, smtp = s.smtp || {};
-    if (s.platform === 'cloudflare') return renderSettingsHttp(body, ro, sms, s.email || {});
+    if (s.platform === 'cloudflare') { renderSettingsHttp(body, ro, sms, s.email || {}); return flightBox(body, ro, s.flight || {}); }
     body.innerHTML = `<div class="bar"><h2>Ειδοποιήσεις</h2></div>
       <p class="mut" style="max-width:75ch">Χωρίς πάροχο, τα SMS και τα email καταγράφονται ως «προσομοίωση» και δεν στέλνονται. Στην Ελλάδα το όνομα αποστολέα SMS χρειάζεται προεγγραφή στον πάροχο.</p>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px" class="modal-like">
@@ -189,6 +204,27 @@
         }, 'PUT');
         toast('Αποθηκεύτηκε');
       } catch (e) { toast(e.message.includes('JSON') ? 'Τα headers και το σώμα πρέπει να είναι έγκυρο JSON' : e.message, 'err'); }
+    };
+    flightBox(body, ro, s.flight || {});
+  }
+
+  // pre-flight limits (both platforms)
+  function flightBox(body, ro, f) {
+    const el = document.createElement('div');
+    const fld = (k, l, unit) => `<label class="mut" for="fl_${k}">${l} (${unit})</label><input id="fl_${k}" class="in" type="number" step="any" value="${esc(f[k] ?? '')}" ${ro ? 'disabled' : ''}>`;
+    el.innerHTML = `<div class="bar" style="margin-top:22px"><h2>Όρια πτήσης drone</h2></div>
+      <p class="mut" style="max-width:80ch">Πριν από κάθε αποστολή ελέγχεται ο τρέχων καιρός στο σημείο (Open-Meteo). Πάνω από τα όρια η αποστολή μπλοκάρεται και μόνο επόπτης μπορεί να την παρακάμψει. Βάλτε τα όρια του drone σας από τον κατασκευαστή.</p>
+      <div class="pane" style="padding:14px;max-width:520px;display:grid;grid-template-columns:1fr 1fr;column-gap:14px">
+        <div>${fld('max_wind', 'Μέγιστος άνεμος', 'm/s')}</div><div>${fld('max_gust', 'Μέγιστες ριπές', 'm/s')}</div>
+        <div>${fld('max_precip', 'Μέγιστη βροχόπτωση', 'mm')}</div><div></div>
+        <div>${fld('min_temp', 'Ελάχιστη θερμοκρασία', '°C')}</div><div>${fld('max_temp', 'Μέγιστη θερμοκρασία', '°C')}</div>
+      </div>${ro ? '' : '<div style="margin-top:12px"><button class="btn pri" id="flSave">Αποθήκευση ορίων</button></div>'}`;
+    body.appendChild(el);
+    $$('.in', el).forEach(i => Object.assign(i.style, { width: '100%', background: 'var(--bg)', border: '1px solid var(--line2)', borderRadius: '8px', padding: '7px 9px', margin: '2px 0 8px' }));
+    if (ro) return;
+    $('#flSave').onclick = async () => {
+      const flight = {}; for (const k of ['max_wind', 'max_gust', 'max_precip', 'min_temp', 'max_temp']) { const v = $('#fl_' + k).value; if (v !== '') flight[k] = +v; }
+      try { await api('/api/admin/settings', { flight }, 'PUT'); toast('Αποθηκεύτηκε'); } catch (e) { toast(e.message, 'err'); }
     };
   }
 

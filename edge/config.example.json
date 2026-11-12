@@ -5,6 +5,8 @@
   "heartbeat_seconds": 30,
   "throttle_seconds": 10,
   "local_webhook_port": 8090,
+  "auto_update": true,
+  "clips": { "enabled": true, "pre_seconds": 10, "post_seconds": 20 },
   "cameras": [
     {
       "key": "nvr1", "name": "NVR Hikvision", "kind": "hikvision",
@@ -20,7 +22,9 @@
       "host": "192.168.1.80", "port": 80, "user": "onvif", "password": "ΚΩΔΙΚΟΣ"
     },
     {
-      "key": "cam-pyli", "name": "Πύλη (push)", "kind": "webhook", "match_ip": "192.168.1.90"
+      "key": "cam-pyli", "name": "Πύλη (push)", "kind": "webhook", "match_ip": "192.168.1.90",
+      "user": "edge", "password": "ΚΩΔΙΚΟΣ", "snapshot_url": "http://192.168.1.90/cgi-bin/snapshot.jpg",
+      "rtsp": "rtsp://{user}:{password}@192.168.1.90:554/stream2"
     }
   ],
   "gpio": [

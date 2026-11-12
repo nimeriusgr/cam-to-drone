@@ -12,3 +12,5 @@ __pycache__/
 *.pyc
 .DS_Store
 cloudflare/package-lock.json.bak
+cloudflare/lib/edge_agent.js
+.wrangler/

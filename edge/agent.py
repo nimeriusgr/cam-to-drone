@@ -8,8 +8,13 @@ into one common format and sends them to the central server over HTTPS (outbound
   python3 agent.py --config config.json          run
   python3 agent.py --discover                    find ONVIF cameras on the local network
   python3 agent.py --config config.json --test   send one test alarm per camera and exit
+  python3 agent.py --config config.json --selftest   check that this file and the config load, then exit
+
+Since 1.1: alarm clips (rolling recording with ffmpeg, a few seconds before and after the alarm), near-live
+frames on request from the console, and self-update from the central server.
 
 Python 3.8+. Standard library only, plus optional:  pip install onvif-zeep  (ONVIF cameras)  gpiozero (dry contacts)
+and the ffmpeg program for clips (sudo apt install ffmpeg).
 """
 import argparse
 import base64
@@ -18,19 +23,23 @@ import email.policy
 import json
 import logging
 import os
+import hashlib
 import re
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 log = logging.getLogger("edge")
 
 # ------------------------------------------------------------------ type normalisation (same names as the server)
@@ -81,12 +90,19 @@ class Uplink:
         with urllib.request.urlopen(req, timeout=timeout, context=self.ctx if self.base.startswith("https") else None) as r:
             return json.loads(r.read() or b"{}")
 
+    def raw(self, path, data=None, headers=None, timeout=60):
+        """POST bytes (or GET when data is None). Returns (body bytes, response headers)."""
+        req = urllib.request.Request(self.base + path, data=data, method="POST" if data is not None else "GET",
+                                     headers={"Authorization": f"Bearer {self.token}", "User-Agent": f"cam2drone-edge/{VERSION}", **(headers or {})})
+        with urllib.request.urlopen(req, timeout=timeout, context=self.ctx if self.base.startswith("https") else None) as r:
+            return r.read(), r.headers
+
     def send_event(self, ev):
         try:
             res = self.post("/api/edge/event", ev)
             self.online = True
             log.info("sent %s %s -> %s", ev["camera_key"], ev["type"], res.get("incident_id") or res.get("suppressed") or "ok")
-            return True
+            return res
         except urllib.error.HTTPError as e:
             if e.code in (400, 401, 403):
                 log.error("server rejected event (%s): %s", e.code, e.read()[:200])
@@ -172,6 +188,42 @@ class Worker(threading.Thread):
             return f"{self.cam['key']}:{c}", chans.get(c, f"{self.cam.get('name', self.cam['key'])} κανάλι {c}")
         return self.cam["key"], self.cam.get("name", self.cam["key"])
 
+    def channel_of(self, key):
+        """Inverse of key_for: camera key -> channel (or None for single cameras)."""
+        if self.cam.get("channels") and key.startswith(self.cam["key"] + ":"):
+            return key[len(self.cam["key"]) + 1:]
+        return None
+
+    def base(self):
+        return f"http://{self.cam['host']}:{self.cam.get('port', 80)}"
+
+    def opener(self):
+        if not getattr(self, "_op", None):
+            self._op = http_opener(self.cam.get("user", ""), self.cam.get("password", ""), self.cam.get("snapshot_url") or self.base())
+        return self._op
+
+    def snapshot_url(self, channel):
+        return self.cam.get("snapshot_url")
+
+    def snapshot(self, channel=None):
+        url = self.snapshot_url(channel)
+        if not url:
+            return None, None
+        if "{channel}" in url:
+            url = url.replace("{channel}", str(channel or 1))
+        return fetch(self.opener(), url)
+
+    def default_rtsp(self, channel):
+        return None
+
+    def rtsp(self, channel=None):
+        """RTSP address for recording clips. Config `rtsp` wins (may contain {channel}); prefer the camera's sub-stream."""
+        url = self.cam.get("rtsp") or self.default_rtsp(channel)
+        if not url:
+            return None
+        return url.replace("{channel}", str(channel or 1)).replace("{user}", quote(self.cam.get("user", ""), safe="")) \
+                  .replace("{password}", quote(self.cam.get("password", ""), safe=""))
+
     def run(self):
         backoff = 2
         while True:
@@ -187,6 +239,12 @@ class Worker(threading.Thread):
 
 class HikvisionWorker(Worker):
     """ISAPI alertStream: long HTTP connection, the camera/NVR pushes <EventNotificationAlert> blocks."""
+
+    def snapshot_url(self, channel):
+        return self.cam.get("snapshot_url") or f"{self.base()}/ISAPI/Streaming/channels/{int(channel or self.cam.get('channel', 1))}01/picture"
+
+    def default_rtsp(self, channel):
+        return "rtsp://{user}:{password}@%s:%s/Streaming/Channels/{channel}02" % (self.cam["host"], self.cam.get("rtsp_port", 554))
 
     def loop(self):
         c = self.cam
@@ -211,13 +269,18 @@ class HikvisionWorker(Worker):
                     if s.get("eventState", "active").lower() != "active":
                         continue  # 'videoloss inactive' is Hikvision's heartbeat
                     ch = s.get("channelID") or s.get("dynChannelID") or c.get("channel", 1)
-                    snap = c.get("snapshot_url") or f"{base}/ISAPI/Streaming/channels/{int(ch)}01/picture"
                     self.agent.emit(self, ch, s.get("eventType"), s.get("targetType") or s.get("detectionTarget"),
-                                    lambda: fetch(op, snap), raw=m.group(0)[:3000])
+                                    lambda ch=ch: self.snapshot(ch), raw=m.group(0)[:3000])
 
 
 class DahuaWorker(Worker):
     """Dahua eventManager attach: multipart text stream with lines Code=...;action=Start;index=N"""
+
+    def snapshot_url(self, channel):
+        return self.cam.get("snapshot_url") or f"{self.base()}/cgi-bin/snapshot.cgi?channel={channel or 1}"
+
+    def default_rtsp(self, channel):
+        return "rtsp://{user}:{password}@%s:%s/cam/realmonitor?channel={channel}&subtype=1" % (self.cam["host"], self.cam.get("rtsp_port", 554))
 
     def loop(self):
         c = self.cam
@@ -233,13 +296,23 @@ class DahuaWorker(Worker):
                 if not m or m.group(2).lower() != "start" or m.group(1) == "Heartbeat":
                     continue
                 ch = int(m.group(3)) + 1
-                snap = c.get("snapshot_url") or f"{base}/cgi-bin/snapshot.cgi?channel={ch}"
                 target = "human" if "human" in line.lower() else "vehicle" if "vehicle" in line.lower() else None
-                self.agent.emit(self, ch, m.group(1), target, lambda: fetch(op, snap), raw=line[:2000])
+                self.agent.emit(self, ch, m.group(1), target, lambda ch=ch: self.snapshot(ch), raw=line[:2000])
 
 
 class OnvifWorker(Worker):
     """ONVIF PullPoint subscription (needs: pip install onvif-zeep). Camera clock must be in sync (NTP)."""
+    snap_uri = None
+    stream_uri = None
+
+    def snapshot_url(self, channel):
+        return self.cam.get("snapshot_url") or self.snap_uri
+
+    def default_rtsp(self, channel):
+        if not self.stream_uri:
+            return None
+        # put the credentials into the address ONVIF gave us
+        return re.sub(r"^rtsp://", "rtsp://{user}:{password}@", self.stream_uri, count=1) if "@" not in self.stream_uri else self.stream_uri
 
     def loop(self):
         try:
@@ -250,13 +323,17 @@ class OnvifWorker(Worker):
         c = self.cam
         cam = ONVIFCamera(c["host"], c.get("port", 80), c["user"], c["password"])
         snap_uri = c.get("snapshot_url")
-        if not snap_uri:
-            try:
-                media = cam.create_media_service()
-                prof = media.GetProfiles()[0]
-                snap_uri = media.GetSnapshotUri({"ProfileToken": prof.token}).Uri
-            except Exception as e:  # noqa: BLE001
-                log.info("[%s] no ONVIF snapshot uri: %s", c["key"], e)
+        try:
+            media = cam.create_media_service()
+            profiles = media.GetProfiles()
+            if not snap_uri:
+                snap_uri = media.GetSnapshotUri({"ProfileToken": profiles[0].token}).Uri
+            sub = profiles[1] if len(profiles) > 1 else profiles[0]  # the second profile is usually the sub-stream
+            self.stream_uri = media.GetStreamUri({"StreamSetup": {"Stream": "RTP-Unicast", "Transport": {"Protocol": "RTSP"}},
+                                                  "ProfileToken": sub.token}).Uri
+        except Exception as e:  # noqa: BLE001
+            log.info("[%s] ONVIF media service: %s", c["key"], e)
+        self.snap_uri = snap_uri
         op = http_opener(c["user"], c["password"], snap_uri) if snap_uri else None
         ev = cam.create_events_service()
         ev.CreatePullPointSubscription()
@@ -368,7 +445,7 @@ class WebhookHub:
             return
         w.connected = True
         w.last = time.time()
-        img = (lambda: image) if image else None
+        img = (lambda: image) if image else (lambda: w.snapshot(summary.get("channelID"))) if w.cam.get("snapshot_url") else None
         self.agent.emit(w, summary.get("channelID"), summary.get("eventType"), summary.get("targetType") or summary.get("detectionTarget"),
                         img, raw=body[:2000].decode("utf-8", "replace"))
 
@@ -406,6 +483,68 @@ KINDS = {"hikvision": HikvisionWorker, "dahua": DahuaWorker, "onvif": OnvifWorke
 
 
 # ------------------------------------------------------------------ agent
+class Recorder(threading.Thread):
+    """Keeps the last few seconds of one camera in short MPEG-TS segments (ffmpeg, stream copy, no re-encoding),
+    so a clip from before the alarm exists. Segments live in RAM (/dev/shm) by default to spare the SD card."""
+
+    def __init__(self, agent, worker, key, channel, root, keep):
+        super().__init__(daemon=True, name=f"rec-{key}")
+        self.agent, self.worker, self.key, self.channel = agent, worker, key, channel
+        self.dir = os.path.join(root, re.sub(r"[^\w.-]", "_", key))
+        self.keep = keep
+        os.makedirs(self.dir, exist_ok=True)
+
+    def run(self):
+        backoff = 5
+        while True:
+            url = self.worker.rtsp(self.channel)
+            if not url:
+                time.sleep(15)  # ONVIF: the address is known after the first connection
+                continue
+            cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp", "-i", url, "-map", "0:v:0", "-c", "copy",
+                   "-f", "segment", "-segment_time", "2", "-segment_wrap", str(self.keep), "-reset_timestamps", "1",
+                   os.path.join(self.dir, "seg%03d.ts")]
+            t0 = time.time()
+            try:
+                p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=None)
+                err = p.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] if p.stderr else []
+                log.warning("[%s] recording stopped (%s), restarting in %ss", self.key, err[0][:200] if err else p.returncode, backoff)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] recording failed: %s", self.key, e)
+            backoff = 5 if time.time() - t0 > 60 else min(120, backoff * 2)
+            time.sleep(backoff)
+
+    def clip(self, t_alarm, pre, post):
+        """Builds an MP4 from the segments around the alarm. Called post+3 seconds after the alarm."""
+        segs = []
+        for n in os.listdir(self.dir):
+            if n.endswith(".ts"):
+                f = os.path.join(self.dir, n)
+                mt = os.path.getmtime(f)
+                if t_alarm - pre <= mt <= t_alarm + post + 3:
+                    segs.append((mt, f))
+        if not segs:
+            return None
+        segs.sort()
+        tmp = tempfile.mkdtemp(prefix="clip-")
+        try:
+            joined = os.path.join(tmp, "in.ts")
+            with open(joined, "wb") as out:
+                for _, f in segs:
+                    with open(f, "rb") as src:
+                        shutil.copyfileobj(src, out)  # MPEG-TS segments can be joined byte by byte
+            mp4 = os.path.join(tmp, "clip.mp4")
+            subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-fflags", "+genpts", "-i", joined, "-c", "copy",
+                            "-movflags", "+faststart", mp4], check=True, timeout=60)
+            with open(mp4, "rb") as f:
+                return f.read()
+        except Exception as e:  # noqa: BLE001
+            log.warning("[%s] clip failed: %s", self.key, e)
+            return None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class Agent:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -413,6 +552,117 @@ class Agent:
         self.workers = self._build()
         self.last = {}
         self.throttle = float(cfg.get("throttle_seconds", 10))
+        self.fast = False
+        self.live = set()
+        self.recorders = {}
+        self.update_failed = None
+        clips = cfg.get("clips") or {}
+        self.clip_pre = float(clips.get("pre_seconds", 10))
+        self.clip_post = float(clips.get("post_seconds", 20))
+        self.clips_on = bool(clips.get("enabled", False))
+
+    def by_key(self, key):
+        for w in self.workers:
+            for k, _ in w.keys():
+                if k == key:
+                    return w
+        return None
+
+    def _recorders(self):
+        if not self.clips_on:
+            return
+        if not shutil.which("ffmpeg"):
+            log.error("clips are enabled but ffmpeg is missing (sudo apt install ffmpeg)")
+            return
+        clips = self.cfg.get("clips") or {}
+        root = clips.get("dir") or ("/dev/shm/cam2drone" if os.path.isdir("/dev/shm") else os.path.join(self.up.spool, "..", "ring"))
+        keep = int((self.clip_pre + self.clip_post) / 2) + 6
+        for w in self.workers:
+            if isinstance(w, GpioWorker) or w.cam.get("record") is False or (isinstance(w, PushCamera) and not w.cam.get("rtsp")):
+                continue
+            for key, _ in w.keys():
+                r = Recorder(self, w, key, w.channel_of(key), root, keep)
+                self.recorders[key] = r
+                r.start()
+        log.info("recording %d camera(s) for clips (%gs before, %gs after the alarm)", len(self.recorders), self.clip_pre, self.clip_post)
+
+    def send_clip(self, key, t_alarm):
+        time.sleep(self.clip_post + 3)
+        data = self.recorders[key].clip(t_alarm, self.clip_pre, self.clip_post)
+        if not data:
+            return
+        for attempt in range(4):
+            try:
+                self.up.raw("/api/edge/clip", data, {"Content-Type": "video/mp4", "X-Camera-Key": key, "X-Ts": f"{t_alarm:.3f}"}, timeout=120)
+                log.info("[%s] clip sent (%d KB)", key, len(data) // 1024)
+                return
+            except urllib.error.HTTPError as e:
+                if e.code in (400, 401, 404, 413, 501):
+                    log.info("[%s] server did not keep the clip (%s)", key, e.code)
+                    return
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] clip upload failed: %s", key, e)
+            time.sleep(15 * (attempt + 1))
+
+    def frame_loop(self):
+        """While the console asks for live view, send about one snapshot per second per camera."""
+        while True:
+            keys = list(self.live)
+            if not keys:
+                time.sleep(1)
+                continue
+            t0 = time.time()
+            for key in keys:
+                w = self.by_key(key)
+                if not w:
+                    continue
+                img, ext = w.snapshot(w.channel_of(key))
+                if img:
+                    try:
+                        self.up.raw("/api/edge/frame", img, {"Content-Type": "image/png" if ext == "png" else "image/jpeg", "X-Camera-Key": key}, timeout=10)
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("frame %s: %s", key, e)
+            time.sleep(max(0.2, 1 - (time.time() - t0)))
+
+    def apply(self, res):
+        self.fast = bool(res.get("fast"))
+        live = set(res.get("live") or [])
+        if live != self.live:
+            log.info("live view: %s", ", ".join(sorted(live)) or "off")
+        self.live = live
+        ag = res.get("agent") or {}
+        auto = self.cfg.get("auto_update", True)
+        if ag.get("version") and ag.get("sha256") and ag["sha256"] != self.update_failed:
+            newer = version_tuple(ag["version"]) > version_tuple(VERSION)
+            if (res.get("update") and ag["version"] != VERSION) or (auto and newer):
+                self.self_update(ag)
+
+    def self_update(self, ag):
+        """Downloads agent.py from the server, checks the hash and that it starts, then replaces itself and restarts."""
+        me = os.path.abspath(__file__)
+        log.info("updating agent %s -> %s", VERSION, ag["version"])
+        try:
+            data, headers = self.up.raw("/api/edge/agent", timeout=60)
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != ag["sha256"] or headers.get("X-Agent-Sha256", digest) != digest:
+                raise RuntimeError("hash mismatch")
+            fd, tmp = tempfile.mkstemp(prefix="agent-", suffix=".py", dir=os.path.dirname(me))
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            test = subprocess.run([sys.executable, tmp, "--config", self.cfg["_path"], "--selftest"], capture_output=True, timeout=60)
+            if test.returncode != 0:
+                os.remove(tmp)
+                raise RuntimeError("new version failed its self-test: " + test.stderr.decode("utf-8", "replace")[-300:])
+            shutil.copy2(me, me + ".bak")
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, me)
+        except Exception as e:  # noqa: BLE001
+            self.update_failed = ag["sha256"]
+            log.error("update failed, staying on %s: %s", VERSION, e)
+            return
+        log.info("update installed, restarting")
+        logging.shutdown()
+        os.execv(sys.executable, [sys.executable, me] + sys.argv[1:])
 
     def _build(self):
         ws = []
@@ -445,33 +695,58 @@ class Agent:
                 ev["image_ext"] = ext or "jpg"
         log.info("[%s] %s (%s)", key, etype, raw_type)
         threading.Thread(target=self.up.send_event, args=(ev,), daemon=True).start()
+        if key in self.recorders:
+            threading.Thread(target=self.send_clip, args=(key, now), daemon=True).start()
 
-    def heartbeat_loop(self):
+    def heartbeat(self):
+        cams = []
+        for w in self.workers:
+            online = w.connected if not isinstance(w, PushCamera) else (time.time() - getattr(w, "last", 0) < 3600 or getattr(w, "last", 0) == 0)
+            for key, name in w.keys():
+                cams.append({"key": key, "name": name, "online": bool(online)})
+        res = self.up.post("/api/edge/heartbeat", {"version": VERSION, "cameras": cams, "hostname": socket.gethostname()})
+        self.up.online = True
+        skew = abs(res.get("server_time", time.time()) - time.time())
+        if skew > 10:
+            log.warning("clock differs from server by %.0fs: enable NTP (needed by ONVIF too)", skew)
+        self.up.flush_spool()
+        return res
+
+    def control_loop(self):
+        """Heartbeat every 30s. While the site has an open incident or someone watches live, also poll every 2s."""
+        every = float(self.cfg.get("heartbeat_seconds", 30))
+        last = 0
         while True:
-            cams = []
-            for w in self.workers:
-                online = w.connected if not isinstance(w, PushCamera) else (time.time() - getattr(w, "last", 0) < 3600 or getattr(w, "last", 0) == 0)
-                for key, name in w.keys():
-                    cams.append({"key": key, "name": name, "online": bool(online)})
             try:
-                res = self.up.post("/api/edge/heartbeat", {"version": VERSION, "cameras": cams, "hostname": socket.gethostname()})
-                self.up.online = True
-                skew = abs(res.get("server_time", time.time()) - time.time())
-                if skew > 10:
-                    log.warning("clock differs from server by %.0fs: enable NTP (needed by ONVIF too)", skew)
-                self.up.flush_spool()
+                if time.time() - last >= every:
+                    res = self.heartbeat()
+                    last = time.time()
+                elif self.fast:
+                    res = self.up.post("/api/edge/poll", {}, timeout=10)
+                else:
+                    res = None
+                if res:
+                    self.apply(res)
             except Exception as e:  # noqa: BLE001
                 self.up.online = False
-                log.warning("heartbeat failed: %s", e)
-            time.sleep(float(self.cfg.get("heartbeat_seconds", 30)))
+                self.fast = False
+                last = time.time()
+                log.warning("server unreachable: %s", e)
+            time.sleep(2)
 
     def run(self):
         if self.cfg.get("local_webhook_port"):
             WebhookHub(self, int(self.cfg["local_webhook_port"])).start()
         for w in self.workers:
             w.start()
+        self._recorders()
+        threading.Thread(target=self.frame_loop, daemon=True, name="frames").start()
         log.info("edge agent %s started with %d sources", VERSION, len(self.workers))
-        self.heartbeat_loop()
+        self.control_loop()
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "0")[:3])
 
 
 # ------------------------------------------------------------------ ONVIF discovery (WS-Discovery, stdlib)
@@ -508,6 +783,7 @@ def main():
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
     ap.add_argument("--discover", action="store_true", help="find ONVIF cameras on the LAN and exit")
     ap.add_argument("--test", action="store_true", help="send one test alarm per configured camera and exit")
+    ap.add_argument("--selftest", action="store_true", help="load the config and build the agent, then exit (used by self-update)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -522,6 +798,9 @@ def main():
         cfg = json.load(f)
     cfg["_path"] = a.config
     agent = Agent(cfg)
+    if a.selftest:
+        print(f"ok {VERSION} · {len(agent.workers)} sources")
+        return
     if a.test:
         for w in agent.workers:
             key, _ = w.keys()[0]

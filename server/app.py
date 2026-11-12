@@ -22,12 +22,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import db       # noqa: E402
+import features  # noqa: E402
 import logic    # noqa: E402
 import parsers  # noqa: E402
 import seed     # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # ------------------------------------------------------------------ admin schema (what the admin pages may edit)
 ADMIN = {
@@ -38,6 +39,7 @@ ADMIN = {
     "cameras": ["org_id", "edge_id", "ext_key", "name", "lat", "lon", "enabled", "snooze_until"],
     "docks": ["name", "lat", "lon", "radius_km", "adapter", "serial", "has_speaker", "has_light", "enabled"],
     "users": ["username", "name", "role", "org_id", "active"],
+    "nofly": ["name", "lat", "lon", "radius_m", "level", "notes", "enabled"],
 }
 ROLES = {"admin", "supervisor", "operator", "customer"}
 
@@ -69,6 +71,17 @@ def incident_action(iid, user, body):
         db.update("incidents", iid, {"assigned_user": user["id"], "acked_ts": inc["acked_ts"] or time.time(),
                                      "status": "ack" if inc["status"] == "new" else inc["status"]})
         logic.add_timeline(iid, "Ανάληψη περιστατικού", who, "ack")
+    elif a == "assign":
+        uid = body.get("user_id")
+        if uid:
+            target = db.q1("SELECT id, name FROM users WHERE id=? AND active=1 AND role IN ('admin','supervisor','operator')", (int(uid),))
+            need(target, 400, "Άγνωστος ελεγκτής")
+            db.update("incidents", iid, {"assigned_user": target["id"], "acked_ts": inc["acked_ts"] or time.time(),
+                                         "status": "ack" if inc["status"] == "new" else inc["status"]})
+            logic.add_timeline(iid, "Ανάθεση σε " + target["name"] if target["id"] != user["id"] else "Ανάληψη περιστατικού", who, "assign")
+        else:
+            db.update("incidents", iid, {"assigned_user": None})
+            logic.add_timeline(iid, "Αποδέσμευση περιστατικού", who, "assign")
     elif a == "sop":
         done = set(inc["sop_done"])
         i = int(body.get("step", -1))
@@ -88,6 +101,7 @@ def incident_action(iid, user, body):
         db.update("incidents", iid, {"status": "closed", "outcome": "Ψευδής συναγερμός", "note": body.get("note", ""),
                                      "closed_ts": time.time(), "assigned_user": inc["assigned_user"] or user["id"]})
         logic.add_timeline(iid, "Κλείσιμο ως ψευδής συναγερμός" + (f": {body['note']}" if body.get("note") else ""), who, "close")
+        features.push("closed", iid)
     elif a == "snooze_camera":
         cid = int(body.get("camera_id") or inc["camera_id"])
         mins = int(body.get("minutes", 60))
@@ -105,6 +119,12 @@ def incident_action(iid, user, body):
             dock = next((d for d in opts if d["available"] and d["in_range"]), None)
         need(dock, 409, "Δεν υπάρχει διαθέσιμο drone εντός εμβέλειας")
         need(dock["available"], 409, f"Το {dock['name']} είναι ήδη σε αποστολή")
+        pre = features.preflight(tgt[0], tgt[1], [dock])
+        chk = dock["check"]
+        if chk["level"] == "block":
+            need(body.get("override"), 409, "Ο έλεγχος πτήσης δεν επιτρέπει την αποστολή: " + "; ".join(i["text"] for i in chk["issues"] if i["level"] == "block"))
+            need(user["role"] in ("admin", "supervisor"), 403, "Μόνο επόπτης ή διαχειριστής μπορεί να παρακάμψει τον έλεγχο πτήσης")
+            need((body.get("override_reason") or "").strip(), 400, "Γράψτε αιτιολογία για την παράκαμψη")
         try:
             logic.adapter_for(dock).dispatch(dock, *tgt)
         except logic.DroneError as e:
@@ -114,6 +134,13 @@ def incident_action(iid, user, body):
         db.update("incidents", iid, {"status": "dispatched", "assigned_user": inc["assigned_user"] or user["id"],
                                      "acked_ts": inc["acked_ts"] or time.time()})
         logic.add_timeline(iid, f"Αποστολή drone από {dock['name']} · {dock['distance_m']/1000:.1f} km", who, "drone")
+        w = pre["weather"]
+        if w:
+            logic.add_timeline(iid, f"Καιρός: άνεμος {w['wind']} m/s, ριπές {w['gust']} m/s, {w['desc'] or '—'}, {w['temp']}°C", who, "check")
+        if chk["issues"]:
+            logic.add_timeline(iid, ("Παράκαμψη ελέγχου πτήσης: " if chk["level"] == "block" else "Προειδοποιήσεις πτήσης: ")
+                               + "; ".join(i["text"] for i in chk["issues"])
+                               + (f" · αιτιολογία: {body['override_reason'].strip()}" if chk["level"] == "block" else ""), who, "check")
     elif a in ("return_home", "light", "camera_mode", "speaker_tts"):
         need(m, 409, "Δεν υπάρχει drone σε πτήση για αυτό το περιστατικό")
         dock = db.q1("SELECT * FROM docks WHERE id=?", (m["dock_id"],))
@@ -175,6 +202,7 @@ def incident_action(iid, user, body):
         db.update("incidents", iid, {"status": "closed", "outcome": outcome, "note": body.get("note", ""),
                                      "closed_ts": time.time(), "assigned_user": inc["assigned_user"] or user["id"]})
         logic.add_timeline(iid, f"Κλείσιμο: {outcome}" + (f" · {body['note']}" if body.get("note") else ""), who, "close")
+        features.push("closed", iid)
     else:
         raise ApiError(400, "Άγνωστη ενέργεια")
     logic.audit(who, f"incident.{a}", f"#{iid}")
@@ -240,9 +268,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def body(self):
+    def body(self, limit=20):
         n = int(self.headers.get("Content-Length") or 0)
-        if n > 20 * 1024 * 1024:
+        if n > limit * 1024 * 1024:
             raise ApiError(413, "Πολύ μεγάλο αίτημα")
         return self.rfile.read(n) if n > 0 else b""
 
@@ -268,11 +296,21 @@ class Handler(BaseHTTPRequestHandler):
             need(u["role"] in roles, 403, "Δεν έχετε δικαίωμα")
         return u
 
-    def file(self, path, ctype=None):
+    def file(self, path, ctype=None, headers=None):
         need(os.path.isfile(path), 404, "Δεν βρέθηκε")
         with open(path, "rb") as f:
             data = f.read()
-        self.send(200, data, ctype or mimetypes.guess_type(path)[0] or "application/octet-stream")
+        ctype = ctype or mimetypes.guess_type(path)[0] or "application/octet-stream"
+        rng = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+        if rng and data and (rng.group(1) or rng.group(2)):
+            size = len(data)
+            a = int(rng.group(1)) if rng.group(1) else max(0, size - int(rng.group(2)))
+            b = int(rng.group(2)) if rng.group(1) and rng.group(2) else size - 1
+            b = min(b, size - 1)
+            if a > b:
+                return self.send(416, b"", ctype, {"Content-Range": f"bytes */{size}"})
+            return self.send(206, data[a:b + 1], ctype, {"Content-Range": f"bytes {a}-{b}/{size}", "Accept-Ranges": "bytes", **(headers or {})})
+        self.send(200, data, ctype, {"Accept-Ranges": "bytes", **(headers or {})})
 
     def handle_any(self, method):
         try:
@@ -307,6 +345,8 @@ class Handler(BaseHTTPRequestHandler):
         # static
         if method == "GET" and path in ("/", "/index.html"):
             return self.file(os.path.join(STATIC, "index.html"), "text/html; charset=utf-8")
+        if method == "GET" and path in ("/sw.js", "/manifest.webmanifest"):
+            return self.file(os.path.join(STATIC, path[1:]), "text/javascript; charset=utf-8" if path.endswith(".js") else "application/manifest+json")
         if method == "GET" and path.startswith("/static/"):
             name = os.path.normpath(unquote(path[len("/static/"):])).replace("\\", "/")
             need(not name.startswith(".."), 404, "Δεν βρέθηκε")
@@ -355,7 +395,34 @@ class Handler(BaseHTTPRequestHandler):
                     db.update("cameras", cam["id"], {"last_seen": time.time(), "online": int(bool(c.get("online", True))), "edge_id": edge["id"]})
                     if was != int(bool(c.get("online", True))):
                         logic.publish("camera", org_id=edge["org_id"], id=cam["id"], online=bool(c.get("online", True)))
-                return self.send(200, {"ok": True, "server_time": time.time()})
+                ag = features.agent_info(meta_only=True)
+                if edge.get("update_requested") and ag and b.get("version") == ag["version"]:
+                    db.update("edges", edge["id"], {"update_requested": 0})
+                    edge["update_requested"] = 0
+                return self.send(200, features.edge_poll(edge))
+            if path == "/api/edge/poll" and method == "POST":
+                return self.send(200, features.edge_poll(edge))
+            if path == "/api/edge/frame" and method == "POST":
+                cam = db.q1("SELECT id FROM cameras WHERE org_id=? AND ext_key=?", (edge["org_id"], self.headers.get("X-Camera-Key", "")))
+                need(cam, 404, "Άγνωστη κάμερα")
+                data = self.body(limit=3)
+                need(data, 400, "Κενή εικόνα")
+                features.store_frame(cam["id"], data, self.headers.get("Content-Type") or "image/jpeg")
+                return self.send(200, {"ok": True})
+            if path == "/api/edge/clip" and method == "POST":
+                data = self.body(limit=40)
+                need(len(data) > 1000, 400, "Κενό βίντεο")
+                try:
+                    ts = float(self.headers.get("X-Ts") or 0)
+                except ValueError:
+                    ts = 0
+                res = features.attach_clip(edge, self.headers.get("X-Camera-Key", ""), ts, data, self.headers.get("Content-Type"))
+                need(res, 404, "Δεν βρέθηκε συναγερμός για αυτό το κλιπ")
+                return self.send(200, res)
+            if path == "/api/edge/agent" and method == "GET":
+                ag = features.agent_info()
+                need(ag, 404, "Δεν βρέθηκε το agent.py στον server")
+                return self.send(200, ag["data"], "text/x-python; charset=utf-8", {"X-Agent-Version": ag["version"], "X-Agent-Sha256": ag["sha256"]})
             raise ApiError(404, "Δεν βρέθηκε")
 
         # auth
@@ -402,7 +469,9 @@ class Handler(BaseHTTPRequestHandler):
             flying = [logic.mission_view(mm) for mm in db.q("SELECT * FROM missions WHERE landed_ts IS NULL")]
             if vis is not None:
                 flying = [f for f in flying if db.q1("SELECT org_id FROM incidents WHERE id=?", (f["incident_id"],))["org_id"] in vis]
-            return self.send(200, {"orgs": orgs, "docks": docks, "missions": flying,
+            extra = {} if vis is not None else {"on_duty": features.on_duty(),
+                                                "nofly": db.q("SELECT id,name,lat,lon,radius_m,level FROM nofly WHERE enabled=1")}
+            return self.send(200, {"orgs": orgs, "docks": docks, "missions": flying, **extra,
                                    "incidents": logic.incident_list(vis), "server_time": time.time(),
                                    "types": {k: v[0] for k, v in logic.TYPES.items()}})
         m = re.fullmatch(r"/api/incidents/(\d+)", path)
@@ -414,6 +483,8 @@ class Handler(BaseHTTPRequestHandler):
             need(vis is None or inc["org_id"] in vis, 404, "Δεν βρέθηκε")
             tgt = logic.target_of(inc)
             inc["dock_options"] = logic.dock_options(*tgt) if tgt and u["role"] != "customer" else []
+            if inc["dock_options"] and inc["status"] != "closed" and not (inc["mission"] and inc["mission"]["phase"] != "landed"):
+                inc["preflight"] = features.preflight(tgt[0], tgt[1], inc["dock_options"])
             inc["police_summary"] = logic.police_summary(inc)
             return self.send(200, inc)
         m = re.fullmatch(r"/api/incidents/(\d+)/action", path)
@@ -468,6 +539,73 @@ class Handler(BaseHTTPRequestHandler):
             self.user(roles={"admin", "supervisor", "operator"})
             return self.send(200, demo_alarm(self.json_body().get("org_id")))
 
+        # shifts
+        if path == "/api/shift":
+            return self.send(200, features.shift_state(self.user(roles=features.STAFF)))
+        if path == "/api/shift/start" and method == "POST":
+            return self.send(200, features.shift_start(self.user(roles=features.STAFF)))
+        if path == "/api/shift/end" and method == "POST":
+            u = self.user(roles=features.STAFF)
+            b = self.json_body()
+            return self.send(200, features.shift_end(u, b.get("note", ""), bool(b.get("release"))))
+
+        # statistics
+        if path in ("/api/stats", "/api/stats/incidents.csv"):
+            u = self.user()
+            vis = logic.visible_org_ids(u)
+            try:
+                to = float(qs.get("to", [time.time()])[0])
+                frm = float(qs.get("from", [to - 30 * 86400])[0])
+                org = int(qs["org_id"][0]) if qs.get("org_id", [""])[0] else None
+            except ValueError:
+                raise ApiError(400, "Λάθος παράμετροι")
+            need(0 < to - frm <= 400 * 86400, 400, "Το διάστημα πρέπει να είναι έως 400 ημέρες")
+            if path.endswith(".csv"):
+                return self.send(200, features.incidents_csv(vis, frm, to, org), "text/csv; charset=utf-8",
+                                 {"Content-Disposition": 'attachment; filename="incidents.csv"'})
+            return self.send(200, features.stats(vis, frm, to, org, staff=u["role"] != "customer"))
+
+        # push notifications
+        if path == "/api/push":
+            features.SUBJECT["value"] = "https://" + (self.headers.get("Host") or "localhost")
+            return self.send(200, features.push_status(self.user()))
+        if path in ("/api/push/subscribe", "/api/push/unsubscribe", "/api/push/test") and method == "POST":
+            u = self.user()
+            b = self.json_body()
+            if path.endswith("unsubscribe"):
+                features.push_unsubscribe(u, b.get("endpoint", ""))
+            elif path.endswith("subscribe"):
+                need(features.webpush.AVAILABLE, 501, features.push_status(u).get("reason", ""))
+                try:
+                    features.push_subscribe(u, b)
+                except ValueError as e:
+                    raise ApiError(400, str(e))
+            else:
+                need(features.webpush.AVAILABLE, 501, features.push_status(u).get("reason", ""))
+                subs = db.q("SELECT * FROM push_subs WHERE user_id=?", (u["id"],))
+                need(subs, 404, "Δεν υπάρχει συσκευή με ενεργές ειδοποιήσεις")
+                res = [features.webpush.send(s, {"title": "Δοκιμαστική ειδοποίηση", "body": "Οι ειδοποιήσεις λειτουργούν.", "tag": "test", "url": "/"},
+                                             features.SUBJECT["value"]) for s in subs]
+                return self.send(200, {"ok": True, "results": res})
+            return self.send(200, {"ok": True, **features.push_status(u)})
+
+        # near-live camera image (through the edge box)
+        m = re.fullmatch(r"/api/cameras/(\d+)/(live|frame)", path)
+        if m:
+            u = self.user()
+            cam = db.q1("SELECT * FROM cameras WHERE id=?", (int(m.group(1)),))
+            vis = logic.visible_org_ids(u)
+            need(cam and (vis is None or cam["org_id"] in vis), 404, "Δεν βρέθηκε")
+            need(cam["edge_id"], 409, "Η κάμερα δεν συνδέεται μέσω κουτιού, άρα δεν υπάρχει ζωντανή εικόνα")
+            features.live_request(cam["id"])
+            fr = features.live_frame(cam["id"])
+            if m.group(2) == "frame":
+                need(fr, 404, "Δεν υπάρχει ακόμα εικόνα")
+                return self.send(200, fr[1], fr[2])
+            edge = db.q1("SELECT last_seen FROM edges WHERE id=?", (cam["edge_id"],))
+            return self.send(200, {"ok": True, "frame_ts": fr[0] if fr else None, "server_time": time.time(),
+                                   "edge_online": bool(edge and edge["last_seen"] and time.time() - edge["last_seen"] < 120)})
+
         # admin
         m = re.fullmatch(r"/api/admin/(\w+)(?:/(\d+))?", path)
         if m:
@@ -478,10 +616,15 @@ class Handler(BaseHTTPRequestHandler):
         u = self.user(roles={"admin", "supervisor"} if method == "GET" else {"admin"})
         if table == "settings":
             if method == "GET":
-                return self.send(200, {"sms": db.setting("sms", {}), "smtp": {**(db.setting("smtp", {}) or {}), "password": "••••" if (db.setting("smtp", {}) or {}).get("password") else ""}})
+                return self.send(200, {"flight": features.flight_limits(), "sms": db.setting("sms", {}), "smtp": {**(db.setting("smtp", {}) or {}), "password": "••••" if (db.setting("smtp", {}) or {}).get("password") else ""}})
             b = self.json_body()
             if "sms" in b:
                 db.set_setting("sms", b["sms"])
+            if "flight" in b:
+                try:
+                    db.set_setting("flight", {k: float(b["flight"][k]) for k in features.FLIGHT_DEFAULTS if k in b["flight"]})
+                except (TypeError, ValueError):
+                    raise ApiError(400, "Τα όρια πτήσης πρέπει να είναι αριθμοί")
             if "smtp" in b:
                 old = db.setting("smtp", {}) or {}
                 new = b["smtp"]
@@ -507,6 +650,8 @@ class Handler(BaseHTTPRequestHandler):
                 if table == "edges":
                     r["token"] = (r.get("token") or "")[:6] + "…"
                     r["cameras"] = db.q1("SELECT COUNT(*) AS n FROM cameras WHERE edge_id=?", (r["id"],))["n"]
+                    ag = features.agent_info(meta_only=True)
+                    r["agent_latest"] = ag["version"] if ag else None
                 if table == "orgs":
                     r["webhook_url"] = f"/webhook/{r['webhook_token']}" if r.get("kind") == "customer" else ""
                     r.pop("webhook_token", None)
@@ -544,6 +689,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {"ok": True, "id": new_id, **extra})
         if method == "PUT":
             need(id_, 400, "Λείπει id")
+            if table == "edges" and b.get("request_update"):
+                data["update_requested"] = 1
             if table == "edges" and b.get("regenerate_token"):
                 data["token"] = secrets.token_urlsafe(24)
                 extra["token"] = data["token"]
@@ -620,6 +767,7 @@ def main():
     except AttributeError:
         pass
     db.init()
+    logic.HOOKS["push"] = features.push
     created = seed.run()
     threading.Thread(target=logic.ticker, daemon=True).start()
     srv = ThreadingHTTPServer((a.host, a.port), Handler)

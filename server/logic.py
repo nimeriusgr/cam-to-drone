@@ -18,6 +18,7 @@ from email.message import EmailMessage
 import db
 
 SIM_SPEED = float(os.environ.get("SIM_SPEED", "1"))
+HOOKS = {}  # set by features.py at start-up (push notifications), keeps this module free of the optional imports
 MERGE_SECONDS = 120          # alarms of the same organisation within this window join one incident
 CAMERA_OFFLINE_AFTER = 120   # seconds without heartbeat
 CRUISE_MS = 15.0             # simulated drone speed m/s
@@ -250,8 +251,8 @@ def ingest(org_id, camera_key, raw_type, target=None, state="active", camera_nam
         reason = "τύπος φιλτραρισμένος"
     if reason:
         ev["suppressed"] = reason
-        db.insert("events", ev)
-        return {"ok": True, "suppressed": reason}
+        eid = db.insert("events", ev)
+        return {"ok": True, "suppressed": reason, "event_id": eid}
 
     label, prio = TYPES.get(etype, TYPES["other"])
     with db.write_lock:
@@ -266,19 +267,21 @@ def ingest(org_id, camera_key, raw_type, target=None, state="active", camera_nam
                 upd.update(priority=prio, type=etype)
             db.update("incidents", inc["id"], upd)
             ev["incident_id"] = inc["id"]
-            db.insert("events", ev)
+            eid = db.insert("events", ev)
             add_timeline(inc["id"], f"Νέο σήμα: {label} · {cam['name']}", kind="signal")
             publish("incident", org_id=org_id, id=inc["id"], merged=True)
-            return {"ok": True, "incident_id": inc["id"], "merged": True}
+            return {"ok": True, "incident_id": inc["id"], "merged": True, "event_id": eid}
 
         iid = db.insert("incidents", {"org_id": org_id, "camera_id": cam["id"], "status": "new", "priority": prio,
                                       "type": etype, "first_ts": now, "last_ts": now, "cameras": [cam["id"]]})
         ev["incident_id"] = iid
-        db.insert("events", ev)
+        eid = db.insert("events", ev)
     add_timeline(iid, f"Συναγερμός: {label} · {cam['name']}", kind="alarm")
     publish("incident", org_id=org_id, id=iid, new=True, priority=prio)
     print(f"[ALARM] #{iid} {org['name']} / {cam['name']} / {label}")
-    return {"ok": True, "incident_id": iid}
+    if HOOKS.get("push"):
+        HOOKS["push"]("new", iid)
+    return {"ok": True, "incident_id": iid, "event_id": eid}
 
 
 def incident_view(iid):
@@ -287,16 +290,18 @@ def incident_view(iid):
         return None
     org = db.q1("SELECT * FROM orgs WHERE id=?", (inc["org_id"],))
     cam = db.q1("SELECT * FROM cameras WHERE id=?", (inc["camera_id"],)) if inc["camera_id"] else None
-    cams = [db.q1("SELECT id,name,lat,lon,online FROM cameras WHERE id=?", (c,)) for c in inc["cameras"]]
+    cams = [db.q1("SELECT id,name,lat,lon,online,edge_id FROM cameras WHERE id=?", (c,)) for c in inc["cameras"]]
     images = [e["image"] for e in db.q("SELECT image FROM events WHERE incident_id=? AND image IS NOT NULL ORDER BY ts", (iid,))]
     user = db.q1("SELECT name FROM users WHERE id=?", (inc["assigned_user"],)) if inc["assigned_user"] else None
     m = db.q1("SELECT * FROM missions WHERE incident_id=? ORDER BY id DESC LIMIT 1", (iid,))
     return {
         **inc, "type_label": type_label(inc["type"]),
         "org": {k: org[k] for k in ("id", "name", "address", "lat", "lon", "sop", "speaker_presets", "notes", "arming_mode")} if org else None,
-        "camera": cam and {k: cam[k] for k in ("id", "name", "lat", "lon", "ext_key")},
+        "camera": cam and {k: cam[k] for k in ("id", "name", "lat", "lon", "ext_key", "edge_id")},
         "camera_list": [c for c in cams if c],
         "images": images[-12:],
+        "clips": db.q("SELECT e.clip AS name, e.ts, c.name AS camera FROM events e LEFT JOIN cameras c ON c.id=e.camera_id "
+                      "WHERE e.incident_id=? AND e.clip IS NOT NULL ORDER BY e.ts", (iid,)),
         "assigned_name": user["name"] if user else None,
         "contacts": db.q("SELECT * FROM contacts WHERE org_id=? ORDER BY priority", (inc["org_id"],)),
         "timeline": db.q("SELECT ts,who,kind,text FROM timeline WHERE incident_id=? ORDER BY ts, id", (iid,)),
@@ -532,9 +537,13 @@ def tick():
             upd = {"last_phase": v["phase"]}
             if v["phase"] == "landed":
                 upd["landed_ts"] = now
+            if v["phase"] == "onsite" and not m.get("onsite_ts"):
+                upd["onsite_ts"] = now
             db.update("missions", m["id"], upd)
             if v["phase"] in ("enroute", "onsite", "landed"):
                 add_timeline(m["incident_id"], PHASES[v["phase"]], kind="drone")
+            if v["phase"] == "onsite" and HOOKS.get("push"):
+                HOOKS["push"]("onsite", m["incident_id"])
         publish("mission", id=m["id"], incident_id=m["incident_id"])
     # escalation of unacknowledged incidents
     for inc in db.q("SELECT i.*, o.ack_timeout FROM incidents i JOIN orgs o ON o.id=i.org_id "
@@ -543,6 +552,8 @@ def tick():
             db.update("incidents", inc["id"], {"escalated": 1, "priority": max(1, inc["priority"] - 1)})
             add_timeline(inc["id"], f"Κλιμάκωση: χωρίς ανάληψη για {inc['ack_timeout']}″, ειδοποίηση επόπτη", kind="escalate")
             publish("escalation", org_id=inc["org_id"], id=inc["id"])
+            if HOOKS.get("push"):
+                HOOKS["push"]("escalation", inc["id"])
     # camera health (only cameras managed by an edge box report heartbeats)
     for c in db.q("SELECT * FROM cameras WHERE edge_id IS NOT NULL AND online=1 AND last_seen<?", (now - CAMERA_OFFLINE_AFTER,)):
         db.update("cameras", c["id"], {"online": 0})

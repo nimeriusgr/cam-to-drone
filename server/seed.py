@@ -34,6 +34,11 @@ DEMO = [
 ]
 DOCKS = [("Dock Γλυφάδας", 37.8690, 23.7530, 6), ("Dock Κηφισιάς", 38.0700, 23.8050, 6),
          ("Dock Ασπρόπυργου", 38.0560, 23.5960, 6)]
+# Example zones only: the real UAS geographical zones must be taken from the civil aviation authority (ΥΠΑ) map.
+NOFLY_NOTE = "Παράδειγμα. Ελέγξτε τις πραγματικές ζώνες στον χάρτη της ΥΠΑ πριν από κάθε χρήση."
+NOFLY = [("Αεροδρόμιο Ελ. Βενιζέλος (παράδειγμα)", 37.9364, 23.9445, 8000, "block"),
+         ("Αεροδρόμιο Τατοΐου (παράδειγμα)", 38.1089, 23.7838, 4000, "block"),
+         ("Αεροδρόμιο Ελευσίνας (παράδειγμα)", 38.0638, 23.5559, 3000, "block")]
 
 
 def run():
@@ -59,6 +64,8 @@ def run():
             db.insert("contacts", {"org_id": oid, "name": cn, "role": role, "phone": phone, "email": mail, "priority": j + 1})
     for name, lat, lon, r in DOCKS:
         db.insert("docks", {"name": name, "lat": lat, "lon": lon, "radius_km": r, "adapter": "sim"})
+    for name, lat, lon, r, lvl in NOFLY:
+        db.insert("nofly", {"name": name, "lat": lat, "lon": lon, "radius_m": r, "level": lvl, "notes": NOFLY_NOTE})
 
     creds = {}
     first_customer = db.q1("SELECT id FROM orgs WHERE kind='customer' ORDER BY id LIMIT 1")["id"]

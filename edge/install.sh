@@ -9,7 +9,7 @@ DATA=/var/lib/cam2drone
 if [ "$(id -u)" -ne 0 ]; then echo "Τρέξτε με sudo"; exit 1; fi
 
 apt-get update -y
-apt-get install -y python3 python3-venv chrony
+apt-get install -y python3 python3-venv chrony ffmpeg   # ffmpeg: κλιπ βίντεο συναγερμών
 systemctl enable --now chrony   # σωστή ώρα: απαραίτητη για ONVIF
 
 id -u cam2drone >/dev/null 2>&1 || useradd --system --home "$DATA" --shell /usr/sbin/nologin cam2drone

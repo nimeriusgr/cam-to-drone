@@ -59,10 +59,23 @@ CREATE TABLE IF NOT EXISTS notifications(
   message TEXT, status TEXT, error TEXT, who TEXT);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts REAL NOT NULL, who TEXT, action TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS shifts(
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, start_ts REAL NOT NULL, end_ts REAL, handover TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS nofly(
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL, radius_m REAL NOT NULL DEFAULT 1000,
+  level TEXT DEFAULT 'block', notes TEXT DEFAULT '', enabled INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS push_subs(
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, endpoint TEXT UNIQUE NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, ts REAL);
 CREATE INDEX IF NOT EXISTS ix_inc_status ON incidents(status, last_ts);
+CREATE INDEX IF NOT EXISTS ix_inc_first ON incidents(first_ts);
 CREATE INDEX IF NOT EXISTS ix_ev_ts ON events(ts);
+CREATE INDEX IF NOT EXISTS ix_ev_cam ON events(camera_id, ts);
 CREATE INDEX IF NOT EXISTS ix_tl_inc ON timeline(incident_id);
+CREATE INDEX IF NOT EXISTS ix_shift_open ON shifts(end_ts);
 """
+
+# columns added after v1.0 (existing databases get them with ALTER TABLE)
+COLUMNS = [("missions", "onsite_ts", "REAL"), ("events", "clip", "TEXT"), ("edges", "update_requested", "INTEGER DEFAULT 0")]
 
 JSON_COLS = {"schedule", "allowed_types", "sop", "cameras", "sop_done", "speaker_presets"}
 
@@ -81,6 +94,9 @@ def conn():
 def init():
     with write_lock:
         conn().executescript(SCHEMA)
+        for table, col, ddl in COLUMNS:
+            if col not in [r[1] for r in conn().execute(f"PRAGMA table_info({table})")]:
+                conn().execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
         conn().commit()
 
 

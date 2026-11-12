@@ -2,40 +2,61 @@
 <html lang="el">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Cam to Drone · Κέντρο ελέγχου</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0a0f15">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>SKYWARDEN · Κέντρο ελέγχου</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@600;700&display=swap">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 <!-- login -->
 <div id="login" class="login" hidden>
-  <form id="loginForm" class="login-card">
-    <div class="brand big"><i></i>Cam to Drone</div>
-    <p class="mut">Κέντρο ελέγχου συναγερμών και drones</p>
-    <label for="lu">Χρήστης</label><input id="lu" autocomplete="username" required>
-    <label for="lp">Κωδικός</label><input id="lp" type="password" autocomplete="current-password" required>
-    <div class="err" id="lerr"></div>
-    <button class="btn pri wide" type="submit">Σύνδεση</button>
-  </form>
+  <div class="login-hero">
+    <div class="login-copy">
+      <div class="brand big">SKYWARDEN</div>
+      <p class="tagline">Alarm to drone.</p>
+      <p class="lead">Κάμερες, ελεγκτής και drone επιτήρησης σε μία οθόνη.</p>
+    </div>
+  </div>
+  <div class="login-side">
+    <form id="loginForm" class="login-card">
+      <h1>Σύνδεση</h1>
+      <p class="mut">Κέντρο ελέγχου συναγερμών</p>
+      <label for="lu">Χρήστης</label><input id="lu" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      <label for="lp">Κωδικός</label><input id="lp" type="password" autocomplete="current-password" required>
+      <div class="err" id="lerr" role="alert"></div>
+      <button class="btn pri wide" type="submit">Σύνδεση</button>
+      <p class="fine">Πρόσβαση μόνο για εξουσιοδοτημένους χρήστες. Κάθε ενέργεια καταγράφεται.</p>
+    </form>
+  </div>
 </div>
 
 <!-- app -->
 <div id="app" class="app" hidden>
   <header class="top">
-    <div class="brand"><i></i>Cam to Drone</div>
+    <div class="brand">SKYWARDEN</div>
     <nav class="tabs" id="nav">
-      <button data-view="console" class="on">Κονσόλα</button>
+      <button data-view="console" class="on" id="navConsole">Κονσόλα</button>
+      <button data-view="cust" id="navCust" hidden>Συναγερμοί</button>
+      <button data-view="reports" id="navReports">Αναφορές</button>
       <button data-view="admin" id="navAdmin">Διαχείριση</button>
     </nav>
     <div class="stats" id="stats"></div>
     <div class="sp"></div>
+    <button class="btn sm ghost" id="shiftBtn" hidden>Βάρδια</button>
     <button class="btn sm ghost" id="demoBtn" title="Δημιουργεί δοκιμαστικό συναγερμό σε τυχαία επιχείρηση">+ Δοκιμαστικός συναγερμός</button>
     <button class="btn sm ghost" id="soundBtn">🔇 Ήχος</button>
     <span class="clock" id="clock"></span>
     <div class="user" id="userBox"><button class="avatar" id="avatar"></button>
       <div class="menu" id="userMenu" hidden>
         <div class="mut" id="userName"></div>
+        <button id="pushBtn">Ειδοποιήσεις σε αυτή τη συσκευή</button>
         <button id="pwBtn">Αλλαγή κωδικού</button>
         <button id="logoutBtn">Αποσύνδεση</button>
       </div>
@@ -52,6 +73,7 @@
       <div class="chips" id="qFilters">
         <button class="chip on" data-f="open">Ανοιχτά</button>
         <button class="chip" data-f="high">Υψηλή</button>
+        <button class="chip" data-f="mine">Δικά μου</button>
         <button class="chip" data-f="drone">Drone</button>
         <button class="chip" data-f="closed">Κλειστά</button>
       </div>
@@ -80,6 +102,8 @@
   </main>
 
   <main id="admin" class="admin" hidden></main>
+  <main id="reports" class="reports" hidden></main>
+  <main id="cust" class="cust" hidden></main>
 </div>
 
 <div id="modal"></div>
@@ -88,5 +112,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="/static/app.js"></script>
 <script src="/static/admin.js"></script>
+<script src="/static/features.js"></script>
 </body>
 </html>
