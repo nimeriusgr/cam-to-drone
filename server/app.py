@@ -93,6 +93,13 @@ def incident_action(iid, user, body):
         else:
             done.discard(i)
         db.update("incidents", iid, {"sop_done": sorted(done)})
+    elif a == "postpone":
+        # drone cannot fly now (weather, zone, equipment): the reason goes to the timeline and the audit log
+        need(not m, 409, "Το drone είναι ήδη σε αποστολή")
+        reason = (body.get("reason") or "").strip()[:500]
+        need(reason, 400, "Γράψτε την αιτία της αναβολής")
+        logic.add_timeline(iid, f"Αναβολή αποστολής drone: {reason}", who, "postpone")
+        body["_detail"] = reason
     elif a == "note":
         need(body.get("text"), 400, "Κενή σημείωση")
         logic.add_timeline(iid, f"Σημείωση: {body['text']}", who, "note")
@@ -205,7 +212,7 @@ def incident_action(iid, user, body):
         features.push("closed", iid)
     else:
         raise ApiError(400, "Άγνωστη ενέργεια")
-    logic.audit(who, f"incident.{a}", f"#{iid}")
+    logic.audit(who, f"incident.{a}", f"#{iid}" + (f" · {body['_detail']}" if body.get("_detail") else ""))
     logic.publish("incident", org_id=inc["org_id"], id=iid)
     return {"ok": True, "incident": logic.incident_view(iid)}
 

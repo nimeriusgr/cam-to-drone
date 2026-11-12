@@ -241,9 +241,13 @@ function renderIncident() {
   }
   // drone
   renderDrone(i, m, flying, cust);
-  // side
-  $('#side').innerHTML = sideHtml(i, m, flying, closed, cust);
-  bindSide(i, m);
+  // side: never rebuild it while the operator is holding push-to-talk (it would replace the button under the finger)
+  if (!S.rec) {
+    const side = $('#side'), top = side.scrollTop;
+    side.innerHTML = sideHtml(i, m, flying, closed, cust);
+    side.scrollTop = top;
+    bindSide(i, m);
+  }
   renderMap();
 }
 
@@ -282,6 +286,7 @@ function sideHtml(i, m, flying, closed, cust) {
       <div class="t2">${esc(i.type_label)} · ${esc(i.camera ? i.camera.name : '')}${i.count > 1 ? ` · ${i.count} σήματα` : ''}</div>
       <div class="row"><span class="pill ${i.status}">${STATUS[i.status]}</span><span class="pill">${PRIO[i.priority]} προτεραιότητα</span>
         ${i.escalated ? '<span class="pill esc">ΚΛΙΜΑΚΩΣΗ</span>' : ''}
+        ${!m && !closed && i.timeline.some(t => t.kind === 'postpone') ? '<span class="pill ack" title="Δείτε την αιτία στο χρονολόγιο">drone σε αναβολή</span>' : ''}
         <span class="mut">${closed ? 'έκλεισε ' + hm(i.closed_ts) : `πριν <span class="timer" data-age="${i.first_ts}">${dur(i.age)}</span>`}</span></div>
       ${cust || closed ? `<div class="mut">#${i.id} · ${i.assigned_name ? 'Ελεγκτής: ' + esc(i.assigned_name) : 'Χωρίς ανάληψη'}</div>` : assignHtml(i)}
     </div>`;
@@ -343,29 +348,48 @@ function bindSide(i, m) {
 }
 
 /* push-to-talk through the drone speaker */
+// Recording lasts exactly while the button (or Space) is held: the pointer is captured, so moving off the button
+// does not stop it, and the side panel is not rebuilt meanwhile. Everything is shown inside the button.
+const PTT_IDLE = 'Πατήστε και κρατήστε για να μιλήσετε';
 function bindPtt(btn) {
+  let holding = false, timer = null;
+  const label = t => { btn.textContent = t; };
   const start = async e => {
-    e.preventDefault(); if (S.rec) return;
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const rec = new MediaRecorder(stream), chunks = [], t0 = Date.now();
-      rec.ondataavailable = ev => chunks.push(ev.data);
-      rec.onstop = async () => {
-        stream.getTracks().forEach(t => t.stop()); btn.classList.remove('rec'); btn.textContent = 'Πατήστε και κρατήστε για να μιλήσετε';
-        const secs = Math.round((Date.now() - t0) / 1000);
-        if (secs < 1) { toast('Πολύ σύντομο μήνυμα'); return; }
+    e.preventDefault();
+    if (holding || S.rec) return;
+    holding = true;
+    if (e.pointerId != null) { try { btn.setPointerCapture(e.pointerId); } catch { } }
+    label('Σύνδεση μικροφώνου…');
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch { holding = false; label(PTT_IDLE); toast('Δεν δόθηκε πρόσβαση στο μικρόφωνο', 'err'); return; }
+    if (!holding) { stream.getTracks().forEach(t => t.stop()); label(PTT_IDLE); toast('Κρατήστε πατημένο όσο μιλάτε'); return; }
+    const rec = new MediaRecorder(stream), chunks = [], t0 = Date.now();
+    rec.ondataavailable = ev => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+    rec.onstop = async () => {
+      clearInterval(timer); stream.getTracks().forEach(t => t.stop());
+      btn.classList.remove('rec'); S.rec = null;
+      const secs = Math.round((Date.now() - t0) / 1000);
+      if (secs < 1) { label(PTT_IDLE); toast('Πολύ σύντομο μήνυμα'); return; }
+      label(`Αποστολή μηνύματος ${secs}″…`); btn.disabled = true;
+      try {
         const blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' });
         const r = await fetch(`/api/incidents/${S.sel}/speaker-audio?secs=${secs}`, { method: 'POST', body: blob, credentials: 'same-origin' });
         const j = await r.json().catch(() => ({}));
         r.ok ? toast(`Μεταδόθηκε φωνητικό μήνυμα ${secs}″`) : toast(j.error || 'Αποτυχία μετάδοσης', 'err');
-        loadIncident();
-      };
-      S.rec = rec; rec.start(); btn.classList.add('rec'); btn.textContent = 'Μιλάτε… αφήστε για αποστολή';
-    } catch (err) { toast('Δεν δόθηκε πρόσβαση στο μικρόφωνο', 'err'); }
+      } catch { toast('Αποτυχία μετάδοσης', 'err'); }
+      btn.disabled = false; label(PTT_IDLE);
+      loadIncident();
+    };
+    S.rec = rec; rec.start(250); btn.classList.add('rec');
+    const tick = () => label(`● Εγγραφή ${dur((Date.now() - t0) / 1000)} · αφήστε για αποστολή`);
+    tick(); timer = setInterval(tick, 500);
   };
-  const stop = () => { if (S.rec) { S.rec.stop(); S.rec = null; } };
-  btn.onpointerdown = start; btn.onpointerup = stop; btn.onpointerleave = stop;
-  btn.onkeydown = e => { if (e.key === ' ' && !S.rec) start(e); }; btn.onkeyup = e => { if (e.key === ' ') stop(); };
+  const stop = () => { holding = false; if (S.rec && S.rec.state === 'recording') S.rec.stop(); };
+  btn.onpointerdown = start;
+  btn.onpointerup = stop; btn.onpointercancel = stop; btn.onlostpointercapture = stop;
+  btn.oncontextmenu = e => e.preventDefault(); // long press on phones must not open a menu
+  btn.onkeydown = e => { if (e.key === ' ' && !e.repeat) start(e); }; btn.onkeyup = e => { if (e.key === ' ') stop(); };
 }
 
 /* ------------------------------------------------------------ actions */
@@ -413,6 +437,7 @@ function dispatchModal() {
     <div id="ovr" hidden>${canOverride ? `<label class="check"><input type="checkbox" id="ovrOk"> Παράκαμψη του ελέγχου πτήσης με δική μου ευθύνη</label>
       <label for="ovrWhy">Αιτιολογία (καταγράφεται στο χρονολόγιο)</label><input id="ovrWhy" placeholder="π.χ. επιβεβαιωμένη εισβολή, άδεια ΥΠΑ για τη ζώνη">`
       : '<p class="err">Ο έλεγχος πτήσης δεν επιτρέπει την αποστολή. Μόνο επόπτης ή διαχειριστής μπορεί να τον παρακάμψει.</p>'}</div>
+    <div class="pp-row"><span class="mut">Δεν μπορεί να πετάξει τώρα;</span><button type="button" class="btn warn" id="ppBtn">Αναβολή αποστολής…</button></div>
     <p class="mut">Ο ελεγκτής είναι υπεύθυνος για την πτήση. Βεβαιωθείτε ότι επιτρέπεται από την άδεια πτήσεων.</p>`,
     'Επιβεβαίωση αποστολής', () => {
       const v = $('input[name=dk]:checked'); if (!v) throw new Error('Επιλέξτε σταθμό');
@@ -427,6 +452,20 @@ function dispatchModal() {
     }, !best);
   const sync = () => { const v = $('input[name=dk]:checked'), d = v && opts.find(x => x.id === +v.value); $('#ovr').hidden = !(d && d.check && d.check.level === 'block'); };
   $$('input[name=dk]').forEach(r => r.onchange = sync); sync();
+  $('#ppBtn').onclick = () => { const v = $('input[name=dk]:checked'); postponeModal(v && opts.find(x => x.id === +v.value), pf); };
+}
+// Drone cannot fly now: the reason is written to the timeline (and the report) and to the audit log.
+const POSTPONE_REASONS = ['Ισχυρός άνεμος / ριπές', 'Βροχή ή καταιγίδα', 'Ομίχλη / χαμηλή ορατότητα', 'Ζώνη απαγόρευσης πτήσης', 'Βλάβη ή φόρτιση drone / Dock'];
+function postponeModal(dock, pf) {
+  const iss = ((dock && dock.check && dock.check.issues) || (pf && pf.issues) || []).map(x => x.text);
+  modal(`<h2>Αναβολή αποστολής drone</h2><p class="mut">Η αιτία καταγράφεται στο χρονολόγιο του περιστατικού, στην αναφορά και στο ιστορικό ενεργειών. Το περιστατικό μένει ανοιχτό και μπορείτε να στείλετε drone αργότερα.</p>
+    <div class="pp-chips">${POSTPONE_REASONS.map((r, k) => `<button type="button" class="chip" data-pp="${k}">${esc(r)}</button>`).join('')}</div>
+    <label for="ppTxt">Αιτία</label><textarea id="ppTxt" placeholder="π.χ. ριπές 18 m/s, νέος έλεγχος σε 30 λεπτά">${esc(iss.join('; '))}</textarea>`,
+    'Καταγραφή αναβολής', () => {
+      const reason = $('#ppTxt').value.trim(); if (!reason) throw new Error('Γράψτε την αιτία της αναβολής');
+      return send({ action: 'postpone', reason }, 'Η αναβολή καταγράφηκε');
+    });
+  $$('.modal [data-pp]').forEach(b => b.onclick = () => { const t = $('#ppTxt'), r = POSTPONE_REASONS[+b.dataset.pp]; t.value = t.value.trim() ? `${r}: ${t.value.trim()}` : r; t.focus(); });
 }
 function notifyModal(channel, ids) {
   const i = S.inc;

@@ -39,7 +39,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 log = logging.getLogger("edge")
 
 # ------------------------------------------------------------------ type normalisation (same names as the server)
@@ -486,6 +486,7 @@ KINDS = {"hikvision": HikvisionWorker, "dahua": DahuaWorker, "onvif": OnvifWorke
 class Recorder(threading.Thread):
     """Keeps the last few seconds of one camera in short MPEG-TS segments (ffmpeg, stream copy, no re-encoding),
     so a clip from before the alarm exists. Segments live in RAM (/dev/shm) by default to spare the SD card."""
+    SEGMENT = 2  # seconds; ffmpeg can only cut at key frames, so real segments follow the camera's I-frame interval
 
     def __init__(self, agent, worker, key, channel, root, keep):
         super().__init__(daemon=True, name=f"rec-{key}")
@@ -502,7 +503,7 @@ class Recorder(threading.Thread):
                 time.sleep(15)  # ONVIF: the address is known after the first connection
                 continue
             cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp", "-i", url, "-map", "0:v:0", "-c", "copy",
-                   "-f", "segment", "-segment_time", "2", "-segment_wrap", str(self.keep), "-reset_timestamps", "1",
+                   "-f", "segment", "-segment_time", str(self.SEGMENT), "-segment_wrap", str(self.keep),
                    os.path.join(self.dir, "seg%03d.ts")]
             t0 = time.time()
             try:
@@ -515,17 +516,20 @@ class Recorder(threading.Thread):
             time.sleep(backoff)
 
     def clip(self, t_alarm, pre, post):
-        """Builds an MP4 from the segments around the alarm. Called post+3 seconds after the alarm."""
+        """Builds an MP4 covering [alarm - pre, alarm + post]. Called post+3 seconds after the alarm.
+        A segment's modification time is when it ended, so it covers [mtime - SEGMENT, mtime]."""
         segs = []
         for n in os.listdir(self.dir):
             if n.endswith(".ts"):
                 f = os.path.join(self.dir, n)
                 mt = os.path.getmtime(f)
-                if t_alarm - pre <= mt <= t_alarm + post + 3:
+                if t_alarm - pre <= mt <= t_alarm + post + self.SEGMENT:
                     segs.append((mt, f))
         if not segs:
             return None
         segs.sort()
+        # trim to the requested window (stream copy starts at the key frame just before, so nothing is lost)
+        offset = max(0.0, (t_alarm - pre) - (segs[0][0] - self.SEGMENT))
         tmp = tempfile.mkdtemp(prefix="clip-")
         try:
             joined = os.path.join(tmp, "in.ts")
@@ -534,8 +538,8 @@ class Recorder(threading.Thread):
                     with open(f, "rb") as src:
                         shutil.copyfileobj(src, out)  # MPEG-TS segments can be joined byte by byte
             mp4 = os.path.join(tmp, "clip.mp4")
-            subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-fflags", "+genpts", "-i", joined, "-c", "copy",
-                            "-movflags", "+faststart", mp4], check=True, timeout=60)
+            subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-fflags", "+genpts", "-ss", f"{offset:.2f}", "-i", joined,
+                            "-t", f"{pre + post:.2f}", "-c", "copy", "-movflags", "+faststart", mp4], check=True, timeout=60)
             with open(mp4, "rb") as f:
                 return f.read()
         except Exception as e:  # noqa: BLE001
@@ -557,8 +561,8 @@ class Agent:
         self.recorders = {}
         self.update_failed = None
         clips = cfg.get("clips") or {}
-        self.clip_pre = float(clips.get("pre_seconds", 10))
-        self.clip_post = float(clips.get("post_seconds", 20))
+        self.clip_pre = float(clips.get("pre_seconds", 5))
+        self.clip_post = float(clips.get("post_seconds", 5))
         self.clips_on = bool(clips.get("enabled", False))
 
     def by_key(self, key):
@@ -576,7 +580,7 @@ class Agent:
             return
         clips = self.cfg.get("clips") or {}
         root = clips.get("dir") or ("/dev/shm/cam2drone" if os.path.isdir("/dev/shm") else os.path.join(self.up.spool, "..", "ring"))
-        keep = int((self.clip_pre + self.clip_post) / 2) + 6
+        keep = int((self.clip_pre + self.clip_post) / Recorder.SEGMENT) + 6
         for w in self.workers:
             if isinstance(w, GpioWorker) or w.cam.get("record") is False or (isinstance(w, PushCamera) and not w.cam.get("rtsp")):
                 continue
@@ -587,7 +591,7 @@ class Agent:
         log.info("recording %d camera(s) for clips (%gs before, %gs after the alarm)", len(self.recorders), self.clip_pre, self.clip_post)
 
     def send_clip(self, key, t_alarm):
-        time.sleep(self.clip_post + 3)
+        time.sleep(self.clip_post + 2 * Recorder.SEGMENT + 1)  # the last segment must be fully written
         data = self.recorders[key].clip(t_alarm, self.clip_pre, self.clip_post)
         if not data:
             return

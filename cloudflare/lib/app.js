@@ -585,6 +585,12 @@ class App {
         if (b.done !== false) { done.add(i); await this.tl(iid, `✓ ${org.sop[i]}`, who, 'sop'); } else done.delete(i);
         await this.db.update('incidents', iid, { sop_done: [...done].sort((x, y) => x - y) }); break;
       }
+      case 'postpone': {
+        // drone cannot fly now (weather, zone, equipment): the reason goes to the timeline and the audit log
+        need(!m, 409, 'Το drone είναι ήδη σε αποστολή');
+        const reason = String(b.reason || '').trim().slice(0, 500); need(reason, 400, 'Γράψτε την αιτία της αναβολής');
+        await this.tl(iid, `Αναβολή αποστολής drone: ${reason}`, who, 'postpone'); b._detail = reason; break;
+      }
       case 'note': need(b.text, 400, 'Κενή σημείωση'); await this.tl(iid, `Σημείωση: ${b.text}`, who, 'note'); break;
       case 'false_alarm':
         need(!m, 409, 'Το drone είναι σε αποστολή. Δώστε πρώτα επιστροφή.');
@@ -666,7 +672,7 @@ class App {
         this.later(this.push('closed', iid)); break;
       default: throw new ApiError(400, 'Άγνωστη ενέργεια');
     }
-    await this.audit(who, `incident.${a}`, `#${iid}`);
+    await this.audit(who, `incident.${a}`, `#${iid}` + (b._detail ? ` · ${b._detail}` : ''));
     return { ok: true, incident: await this.incidentView(iid) };
   }
 
