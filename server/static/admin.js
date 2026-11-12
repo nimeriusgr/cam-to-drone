@@ -71,8 +71,9 @@
     },
     nofly: {
       title: 'Ζώνες απαγόρευσης πτήσης', table: 'nofly', add: 'Νέα ζώνη',
-      intro: 'Πριν από κάθε αποστολή drone ελέγχεται αν ο στόχος ή η διαδρομή από τον σταθμό περνά από ενεργή ζώνη. «Απαγόρευση»: η αποστολή μπλοκάρεται και μόνο επόπτης μπορεί να την παρακάμψει με αιτιολογία. «Προσοχή»: εμφανίζεται προειδοποίηση. Οι επίσημες ζώνες UAS δημοσιεύονται από την ΥΠΑ.',
-      cols: [['Ζώνη', r => `<b>${esc(r.name)}</b><div class="mut">${esc(r.notes || '')}</div>`], ['Κέντρο', r => `${(+r.lat).toFixed(5)}, ${(+r.lon).toFixed(5)}`], ['Ακτίνα', r => (r.radius_m >= 1000 ? (r.radius_m / 1000).toFixed(1) + ' km' : r.radius_m + ' m')],
+      intro: 'Πριν από κάθε αποστολή drone ελέγχεται αν ο στόχος ή η διαδρομή από τον σταθμό περνά από ενεργή ζώνη (κύκλος ή πολύγωνο). «Απαγόρευση»: η αποστολή μπλοκάρεται και μόνο επόπτης μπορεί να την παρακάμψει με αιτιολογία. «Προσοχή»: εμφανίζεται προειδοποίηση. Οι επίσημες γεωγραφικές ζώνες UAS της ΥΠΑ φαίνονται στον χάρτη <a href="https://dagr.hasp.gov.gr/" target="_blank" rel="noopener">Drone Aware GR</a>· ζητήστε τες από την ΥΠΑ ως αρχείο (ED-269, GeoJSON ή KML) και φορτώστε τες με «Εισαγωγή αρχείου».',
+      extra: '<button class="btn" id="nfImport">Εισαγωγή αρχείου…</button>',
+      cols: [['Ζώνη', r => `<b>${esc(r.name)}</b><div class="mut">${esc(r.notes || '')}</div>`], ['Κέντρο', r => `${(+r.lat).toFixed(5)}, ${(+r.lon).toFixed(5)}`], ['Σχήμα', r => r.geom ? `πολύγωνο<div class="mut">${esc(r.source || '')}</div>` : 'κύκλος ' + (r.radius_m >= 1000 ? (r.radius_m / 1000).toFixed(1) + ' km' : r.radius_m + ' m')],
         ['Επίπεδο', r => r.level === 'block' ? '<span class="pill new">Απαγόρευση</span>' : '<span class="pill ack">Προσοχή</span>'], ['Ενεργή', r => r.enabled ? 'Ναι' : 'Όχι']],
       fields: () => [['name', 'Όνομα', 'text', { required: true }], ['lat', 'Γεωγρ. πλάτος κέντρου', 'number', { required: true }], ['lon', 'Γεωγρ. μήκος κέντρου', 'number', { required: true }],
         ['radius_m', 'Ακτίνα (μέτρα)', 'number', { required: true }], ['level', 'Επίπεδο', 'select', { options: { block: 'Απαγόρευση (μπλοκάρει την αποστολή)', warn: 'Προσοχή (μόνο προειδοποίηση)' } }],
@@ -81,7 +82,10 @@
     users: {
       title: 'Χρήστες', table: 'users', add: 'Νέος χρήστης',
       cols: [['Χρήστης', r => `<b>${esc(r.name)}</b><div class="mut">${esc(r.username)}</div>`], ['Ρόλος', r => ({ admin: 'Διαχειριστής', supervisor: 'Επόπτης', operator: 'Ελεγκτής', customer: 'Πελάτης' })[r.role]],
-        ['Επιχείρηση', r => esc(orgName(r.org_id) || '—')], ['API token', r => `<code>${esc(r.api_token)}</code>`], ['Ενεργός', r => r.active ? 'Ναι' : 'Όχι']],
+        ['Επιχείρηση', r => esc(orgName(r.org_id) || '—')], ['API token', r => `<code>${esc(r.api_token)}</code>`], ['Ενεργός', r => r.active ? 'Ναι' : 'Όχι'],
+        ['2 βήματα', r => r.totp_on ? '<span class="pill ack">ενεργό</span>' : '<span class="mut">όχι</span>'],
+        ['', r => S.me.role !== 'admin' ? '' : [r.locked_until > Date.now() / 1000 ? `<span class="pill new">κλειδωμένος</span> <button class="btn sm" data-unlock="${r.id}">Ξεκλείδωμα</button>` : '',
+          r.totp_on ? `<button class="btn sm" data-reset2fa="${r.id}" title="Αν ο χρήστης έχασε το κινητό του">Επαναφορά 2 βημάτων</button>` : ''].join(' ')]],
       fields: (r) => [['username', 'Όνομα χρήστη', 'text', { required: true }], ['name', 'Ονοματεπώνυμο', 'text', { required: true }],
         ['role', 'Ρόλος', 'select', { options: { operator: 'Ελεγκτής', supervisor: 'Επόπτης', admin: 'Διαχειριστής', customer: 'Πελάτης (μόνο προβολή της επιχείρησής του)' } }],
         ['org_id', 'Επιχείρηση (για πελάτες)', 'select', { options: orgOptions(true) }], ['active', 'Ενεργός', 'check'],
@@ -118,12 +122,16 @@
       if (page === 'events') return renderLog(body, 'events');
       if (page === 'audit') return renderLog(body, 'audit');
       const p = PAGES[page], rows = page === 'orgs' || page === 'edges' ? cache[page] : await load(p.table);
-      body.innerHTML = `<div class="bar"><h2>${p.title}</h2><span class="mut">${rows.length}</span><span class="sp"></span>${ro ? '<span class="mut">μόνο προβολή</span>' : `<button class="btn pri" id="aAdd">${p.add}</button>`}</div>
+      body.innerHTML = `<div class="bar"><h2>${p.title}</h2><span class="mut">${rows.length}</span><span class="sp"></span>${ro ? '<span class="mut">μόνο προβολή</span>' : `${p.extra || ''}<button class="btn pri" id="aAdd">${p.add}</button>`}</div>
         ${p.intro ? `<p class="mut" style="max-width:90ch;margin-top:-4px">${p.intro}</p>` : ''}
         <table><thead><tr>${p.cols.map(c => `<th>${c[0]}</th>`).join('')}${ro ? '' : '<th></th>'}</tr></thead>
         <tbody>${rows.map(r => `<tr>${p.cols.map(c => `<td>${c[1](r)}</td>`).join('')}${ro ? '' : `<td style="white-space:nowrap"><button class="btn sm" data-edit="${r.id}">Επεξεργασία</button> <button class="btn sm" data-del="${r.id}">Διαγραφή</button></td>`}</tr>`).join('')
         || `<tr><td colspan="9" class="mut">Δεν υπάρχουν εγγραφές.</td></tr>`}</tbody></table>`;
       $$('[data-camctl]', body).forEach(b => b.onclick = () => Features.openCamera(+b.dataset.camctl));
+      $$('[data-unlock]', body).forEach(b => b.onclick = async () => { try { await api(`/api/admin/users/${b.dataset.unlock}`, { unlock: true }, 'PUT'); toast('Ο λογαριασμός ξεκλειδώθηκε'); render(); } catch (e) { toast(e.message, 'err'); } });
+      $$('[data-reset2fa]', body).forEach(b => b.onclick = () => modal('<h2>Επαναφορά επαλήθευσης 2 βημάτων;</h2><p>Ο χρήστης θα συνδέεται μόνο με κωδικό μέχρι να την ενεργοποιήσει ξανά από το μενού του. Κάντε το μόνο αν έχετε επιβεβαιώσει ότι είναι ο ίδιος.</p>',
+        'Επαναφορά', async () => { await api(`/api/admin/users/${b.dataset.reset2fa}`, { reset_2fa: true }, 'PUT'); toast('Έγινε επαναφορά'); render(); }));
+      const nfi = $('#nfImport'); if (nfi) nfi.onclick = importZonesModal;
       if (ro) return;
       $('#aAdd').onclick = () => form(p, null);
       $$('[data-edit]', body).forEach(b => b.onclick = () => form(p, rows.find(r => r.id === +b.dataset.edit)));
@@ -181,7 +189,7 @@
 
   async function renderSettings(body, ro) {
     const s = await api('/api/admin/settings'), sms = s.sms || {}, smtp = s.smtp || {};
-    if (s.platform === 'cloudflare') { renderSettingsHttp(body, ro, sms, s.email || {}); flightBox(body, ro, s.flight || {}); return mediaBox(body, ro, s.media || {}); }
+    if (s.platform === 'cloudflare') { renderSettingsHttp(body, ro, sms, s.email || {}); flightBox(body, ro, s.flight || {}); mediaBox(body, ro, s.media || {}); return retentionBox(body, ro, s.retention_days); }
     body.innerHTML = `<div class="bar"><h2>Ειδοποιήσεις</h2></div>
       <p class="mut" style="max-width:75ch">Χωρίς πάροχο, τα SMS και τα email καταγράφονται ως «προσομοίωση» και δεν στέλνονται. Στην Ελλάδα το όνομα αποστολέα SMS χρειάζεται προεγγραφή στον πάροχο.</p>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px" class="modal-like">
@@ -211,6 +219,68 @@
     };
     flightBox(body, ro, s.flight || {});
     mediaBox(body, ro, s.media || {});
+    retentionBox(body, ro, s.retention_days);
+  }
+
+  // GDPR: how long images, clips and voice messages are kept (incidents and their timeline stay)
+  function retentionBox(body, ro, days) {
+    const el = document.createElement('div');
+    el.innerHTML = `<div class="bar" style="margin-top:22px"><h2>Διατήρηση δεδομένων (GDPR)</h2></div>
+      <p class="mut" style="max-width:85ch">Οι εικόνες, τα κλιπ και τα φωνητικά μηνύματα διαγράφονται αυτόματα μετά από τόσες ημέρες. Τα περιστατικά, το χρονολόγιο και οι αναφορές μένουν (χωρίς τις εικόνες). 0 = χωρίς αυτόματη διαγραφή.</p>
+      <div class="pane" style="padding:14px;max-width:320px"><label class="mut" for="rtD">Ημέρες διατήρησης</label><input id="rtD" class="in" type="number" min="0" max="3650" value="${esc(days ?? 30)}" ${ro ? 'disabled' : ''}></div>
+      ${ro ? '' : '<div style="margin-top:12px"><button class="btn pri" id="rtSave">Αποθήκευση</button></div>'}`;
+    body.appendChild(el);
+    $$('.in', el).forEach(i => Object.assign(i.style, { width: '100%', background: 'var(--bg)', border: '1px solid var(--line2)', borderRadius: '8px', padding: '7px 9px', margin: '2px 0 8px' }));
+    if (!ro) $('#rtSave').onclick = async () => { try { await api('/api/admin/settings', { retention_days: +$('#rtD').value }, 'PUT'); toast('Αποθηκεύτηκε'); } catch (e) { toast(e.message, 'err'); } };
+  }
+
+  // ---- import of official zones: ED-269 JSON (EU standard), GeoJSON or KML, converted here to polygons / circles
+  const ED269_LEVEL = { PROHIBITED: 'block', REQ_AUTHORISATION: 'block', CONDITIONAL: 'warn', NO_RESTRICTION: 'warn' };
+  function parseZones(text, fname) {
+    const out = [], t = text.trim();
+    if (t.startsWith('<')) { // KML
+      const doc = new DOMParser().parseFromString(t, 'application/xml');
+      for (const pm of doc.getElementsByTagName('Placemark')) {
+        const name = (pm.getElementsByTagName('name')[0] || {}).textContent || 'Ζώνη';
+        const polys = [...pm.getElementsByTagName('Polygon')].map(pg => [...pg.getElementsByTagName('coordinates')].map(c =>
+          c.textContent.trim().split(/\s+/).map(x => x.split(',').slice(0, 2).map(Number)).filter(q => q.length === 2 && q.every(Number.isFinite))));
+        if (polys.length) out.push({ name: name.trim(), geom: polys.length === 1 ? { type: 'Polygon', coordinates: polys[0] } : { type: 'MultiPolygon', coordinates: polys } });
+      }
+      return out;
+    }
+    const j = JSON.parse(t), feats = j.features || (Array.isArray(j) ? j : []);
+    for (const f of feats) {
+      if (f.type === 'Feature' && f.geometry) { // GeoJSON
+        const pr = f.properties || {}, g = f.geometry;
+        if (['Polygon', 'MultiPolygon'].includes(g.type)) out.push({ name: pr.name || pr.Name || pr.title || pr.identifier || 'Ζώνη', geom: g, ext_id: pr.identifier || pr.id || f.id, level: ED269_LEVEL[pr.restriction] || undefined, notes: pr.message || pr.reason || '' });
+        continue;
+      }
+      for (const geo of f.geometry || []) { // ED-269: one zone, several volumes
+        const hp = geo.horizontalProjection || {};
+        const base = { name: f.name || f.identifier || 'Ζώνη', ext_id: f.identifier, level: ED269_LEVEL[f.restriction] || 'warn', notes: [f.message, geo.lowerLimit != null ? `${geo.lowerLimit}-${geo.upperLimit} ${geo.uomDimensions || 'm'}` : ''].filter(Boolean).join(' · ') };
+        if (hp.type === 'Circle' && hp.center) out.push({ ...base, lon: hp.center[0], lat: hp.center[1], radius_m: hp.radius });
+        else if (['Polygon', 'MultiPolygon'].includes(hp.type)) out.push({ ...base, geom: { type: hp.type, coordinates: hp.coordinates } });
+      }
+    }
+    return out;
+  }
+  function importZonesModal() {
+    modal(`<h2>Εισαγωγή ζωνών από αρχείο</h2>
+      <p class="mut">Δεκτά: <b>ED-269</b> (JSON, το πρότυπο της ΕΕ για τις γεωγραφικές ζώνες UAS), <b>GeoJSON</b> ή <b>KML</b>, σε συντεταγμένες WGS84.</p>
+      <label for="nfF">Αρχείο</label><input id="nfF" type="file" accept=".json,.geojson,.kml,application/json,application/vnd.google-earth.kml+xml">
+      <label for="nfS">Πηγή (εμφανίζεται στον πίνακα)</label><input id="nfS" value="ΥΠΑ">
+      <label for="nfL">Επίπεδο για ζώνες χωρίς ένδειξη</label><select id="nfL"><option value="block">Απαγόρευση</option><option value="warn">Προσοχή</option></select>
+      <label class="check"><input type="checkbox" id="nfR" checked> Αντικατάσταση των ζωνών που είχαν φορτωθεί από την ίδια πηγή</label>
+      <div class="mut" id="nfInfo"></div>`, 'Εισαγωγή', async () => {
+      const f = $('#nfF').files[0]; if (!f) throw new Error('Επιλέξτε αρχείο');
+      if (f.size > 15e6) throw new Error('Το αρχείο είναι πάνω από 15 MB');
+      let zones; try { zones = parseZones(await f.text(), f.name); } catch (e) { throw new Error('Το αρχείο δεν διαβάστηκε: ' + e.message); }
+      if (!zones.length) throw new Error('Δεν βρέθηκαν πολύγωνα ή κύκλοι στο αρχείο');
+      zones.forEach(z => { if (!z.level) z.level = $('#nfL').value; });
+      const r = await api('/api/admin/nofly/import', { zones, source: $('#nfS').value.trim(), replace: $('#nfR').checked });
+      toast(`Φορτώθηκαν ${r.imported} ζώνες`); render();
+    });
+    $('#nfF').onchange = async () => { const f = $('#nfF').files[0]; if (!f) return; try { $('#nfInfo').textContent = `Βρέθηκαν ${parseZones(await f.text(), f.name).length} ζώνες στο αρχείο.`; } catch (e) { $('#nfInfo').textContent = 'Το αρχείο δεν διαβάστηκε: ' + e.message; } };
   }
 
   // live video + audio: address of the media server (empty = off, the console shows ~1 frame per second)

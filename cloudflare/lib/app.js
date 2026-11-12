@@ -51,6 +51,9 @@ const CAM_CMDS = {
   ircut: ['Λειτουργία ημέρας/νύχτας', 'ircut', STAFF], reboot: ['Επανεκκίνηση κάμερας', 'onvif', ['admin', 'supervisor']], caps: ['Ανάγνωση δυνατοτήτων', null, STAFF],
 };
 const COMMAND_TTL = 60;
+const EDGE_OFFLINE_AFTER = 180;                     // box silent this long -> technical incident
+const LOCK_AFTER = 5, LOCK_SECONDS = 900;           // wrong passwords before the account locks, lock time
+const IP_LIMIT = 20, IP_WINDOW = 900;               // failures from one address in 15 minutes -> refused
 const wxCache = new Map(); // per isolate, 10 minutes
 const PHASES = { enroute: 'Το drone απογειώθηκε, σε πορεία', onsite: 'Το drone έφτασε στο σημείο', landed: 'Το drone προσγειώθηκε στο Dock' };
 const COMMANDS = { ack: 'ack', dispatch_drone: 'dispatch', return_home: 'return_home', false_alarm: 'false_alarm', close: 'close',
@@ -149,6 +152,46 @@ function segDist(lat1, lon1, lat2, lon2, plat, plon) {
   return Math.hypot(ax + t * dx, ay + t * dy);
 }
 const levelOf = iss => iss.some(i => i.level === 'block') ? 'block' : iss.length ? 'warn' : 'ok';
+
+// ------------------------------------------------------------------ polygons (GeoJSON Polygon / MultiPolygon, lon/lat)
+function polygonsOf(geom) {
+  if (!geom) return [];
+  let g = geom; if (typeof g === 'string') { try { g = JSON.parse(g); } catch { return []; } }
+  return g.type === 'Polygon' ? [g.coordinates] : g.type === 'MultiPolygon' ? g.coordinates : [];
+}
+function inRing(x, y, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i], [xj, yj] = ring[j];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / ((yj - yi) || 1e-12) + xi) inside = !inside;
+  }
+  return inside;
+}
+const inPolygons = (x, y, polys) => polys.some(p => p.length && inRing(x, y, p[0]) && !p.slice(1).some(h => inRing(x, y, h)));
+function segCross(a, b, c, d) {
+  const o = (p, q, r) => (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+  return (o(a, b, c) > 0) !== (o(a, b, d) > 0) && (o(c, d, a) > 0) !== (o(c, d, b) > 0);
+}
+function pathHitsPolygons(a, b, polys) {
+  if (inPolygons(a[0], a[1], polys) || inPolygons(b[0], b[1], polys)) return true;
+  for (const p of polys) for (const ring of p) for (let i = 0; i < ring.length - 1; i++) if (segCross(a, b, ring[i], ring[i + 1])) return true;
+  return false;
+}
+
+// ------------------------------------------------------------------ two-step login (TOTP, RFC 6238)
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function b32(bytes) { let bits = 0, val = 0, out = ''; for (const x of bytes) { val = (val << 8) | x; bits += 8; while (bits >= 5) { out += B32[(val >>> (bits - 5)) & 31]; bits -= 5; } } if (bits) out += B32[(val << (5 - bits)) & 31]; return out; }
+function b32d(s) { let bits = 0, val = 0; const out = []; for (const ch of String(s).toUpperCase().replace(/=+$/, '')) { const i = B32.indexOf(ch); if (i < 0) continue; val = (val << 5) | i; bits += 5; if (bits >= 8) { out.push((val >>> (bits - 8)) & 255); bits -= 8; } } return new Uint8Array(out); }
+async function totpCode(secret, counter) {
+  const key = await crypto.subtle.importKey('raw', b32d(secret), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+  const msg = new Uint8Array(8); new DataView(msg.buffer).setUint32(4, counter);
+  const h = new Uint8Array(await crypto.subtle.sign('HMAC', key, msg)), o = h[19] & 15;
+  return String(((h[o] & 127) << 24 | h[o + 1] << 16 | h[o + 2] << 8 | h[o + 3]) % 1000000).padStart(6, '0');
+}
+async function totpOk(secret, code) {
+  code = String(code || '').replace(/\D/g, ''); if (!secret || code.length !== 6) return false;
+  const t = Math.floor(now() / 30); for (const w of [-1, 0, 1]) if (await totpCode(secret, t + w) === code) return true; return false;
+}
 
 // ------------------------------------------------------------------ Web Push (RFC 8291 aes128gcm + RFC 8292 VAPID), WebCrypto only
 const te = s => new TextEncoder().encode(s);
@@ -450,11 +493,91 @@ class App {
   async zoneIssues(dock, lat, lon, zones) {
     const out = [];
     for (const z of zones) {
-      const lvl = z.level === 'block' ? 'block' : 'warn';
-      if (haversine(z.lat, z.lon, lat, lon) <= z.radius_m) out.push({ level: lvl, text: `Ο στόχος είναι μέσα στη ζώνη «${z.name}»`, zone_id: z.id });
-      else if (dock && segDist(dock.lat, dock.lon, lat, lon, z.lat, z.lon) <= z.radius_m) out.push({ level: lvl, text: `Η διαδρομή από ${dock.name} περνά από τη ζώνη «${z.name}»`, zone_id: z.id });
+      const lvl = z.level === 'block' ? 'block' : 'warn', polys = polygonsOf(z.geom);
+      let inside, path;
+      if (polys.length) { inside = inPolygons(lon, lat, polys); path = !inside && dock && pathHitsPolygons([dock.lon, dock.lat], [lon, lat], polys); }
+      else { inside = haversine(z.lat, z.lon, lat, lon) <= z.radius_m; path = !inside && dock && segDist(dock.lat, dock.lon, lat, lon, z.lat, z.lon) <= z.radius_m; }
+      if (inside) out.push({ level: lvl, text: `Ο στόχος είναι μέσα στη ζώνη «${z.name}»`, zone_id: z.id });
+      else if (path) out.push({ level: lvl, text: `Η διαδρομή από ${dock.name} περνά από τη ζώνη «${z.name}»`, zone_id: z.id });
     }
     return out;
+  }
+
+  // ---------------- technical alerts: box or camera stops answering (same as server/features.py)
+  async technical(orgId, camId, text) {
+    const t = now();
+    const inc = await this.db.q1("SELECT * FROM incidents WHERE org_id=? AND status!='closed' AND type IN ('offline','videoloss') ORDER BY id DESC LIMIT 1", [orgId]);
+    if (inc) {
+      const cams = inc.cameras; if (camId && !cams.includes(camId)) cams.push(camId);
+      await this.db.update('incidents', inc.id, { last_ts: t, count: inc.count + 1, cameras: cams });
+      await this.tl(inc.id, text, 'σύστημα', 'alarm'); return inc.id;
+    }
+    const iid = await this.db.insert('incidents', { org_id: orgId, camera_id: camId || null, status: 'new', priority: 4, type: 'offline', first_ts: t, last_ts: t, cameras: camId ? [camId] : [] });
+    await this.tl(iid, text, 'σύστημα', 'alarm');
+    this.later(this.push('new', iid));
+    return iid;
+  }
+  async backOnline(orgId, text) {
+    const inc = await this.db.q1("SELECT id FROM incidents WHERE org_id=? AND status!='closed' AND type IN ('offline','videoloss') ORDER BY id DESC LIMIT 1", [orgId]);
+    if (inc) await this.tl(inc.id, text, 'σύστημα', 'info');
+  }
+  async offlineCheck() {
+    for (const e of await this.db.q('SELECT * FROM edges WHERE last_seen IS NOT NULL AND last_seen<? AND offline_since IS NULL', [now() - EDGE_OFFLINE_AFTER])) {
+      const r = await this.env.DB.prepare('UPDATE edges SET offline_since=? WHERE id=? AND offline_since IS NULL').bind(e.last_seen, e.id).run();
+      if (!r.meta || r.meta.changes !== 1) continue;
+      await this.technical(e.org_id, null, `Το κουτί «${e.name}» δεν επικοινωνεί από ${fmtTime(e.last_seen, { hour: '2-digit', minute: '2-digit' })} (ρεύμα, internet ή βλάβη στην επιχείρηση)`);
+    }
+  }
+  async edgeSeen(edge) {
+    if (!edge.offline_since) return;
+    await this.db.update('edges', edge.id, { offline_since: null });
+    await this.backOnline(edge.org_id, `Το κουτί «${edge.name}» επικοινωνεί ξανά (εκτός για περίπου ${Math.floor((now() - edge.offline_since) / 60)} λεπτά)`);
+  }
+  async cameraState(edge, cam, online) {
+    if (!online && !cam.offline_since) {
+      await this.db.update('cameras', cam.id, { offline_since: now() });
+      await this.technical(edge.org_id, cam.id, `Η κάμερα «${cam.name}» δεν απαντά στο κουτί (ρεύμα, καλώδιο ή βλάβη κάμερας)`);
+    } else if (online && cam.offline_since) {
+      await this.db.update('cameras', cam.id, { offline_since: null });
+      await this.backOnline(edge.org_id, `Η κάμερα «${cam.name}» λειτουργεί ξανά`);
+    }
+  }
+
+  // ---------------- data retention (GDPR): images, clips and voice messages older than N days are deleted
+  async retentionDays() { const d = await this.db.setting('retention_days', 30); return Number.isFinite(+d) ? Math.max(0, +d) : 30; }
+  async retentionRun() {
+    const days = await this.retentionDays(); if (!days) return 0;
+    const cutoff = now() - days * 86400; let n = 0;
+    if (this.env.MEDIA) {
+      let cursor;
+      for (let page = 0; page < 5; page++) {
+        const l = await this.env.MEDIA.list({ limit: 1000, cursor });
+        const old = l.objects.filter(o => o.uploaded.getTime() / 1000 < cutoff).map(o => o.key);
+        for (let i = 0; i < old.length; i += 1000) await this.env.MEDIA.delete(old.slice(i, i + 1000));
+        n += old.length;
+        if (!l.truncated) break; cursor = l.cursor;
+      }
+    }
+    n += (await this.env.DB.prepare('DELETE FROM media WHERE ts<?').bind(cutoff).run()).meta.changes || 0;
+    await this.db.ex('UPDATE events SET image=NULL WHERE ts<? AND image IS NOT NULL', [cutoff]);
+    await this.db.ex('UPDATE events SET clip=NULL WHERE ts<? AND clip IS NOT NULL', [cutoff]);
+    await this.db.ex('DELETE FROM live_frames WHERE ts<?', [now() - 86400]);
+    await this.db.ex('DELETE FROM login_fail WHERE first<?', [now() - 86400]);
+    if (n) await this.audit('σύστημα', 'retention', `διαγράφηκαν ${n} αρχεία παλαιότερα των ${days} ημερών`);
+    return n;
+  }
+
+  // ---------------- login protection
+  async ipBlocked(ip) { const r = await this.db.q1('SELECT * FROM login_fail WHERE ip=?', [ip]); return !!(r && r.n >= IP_LIMIT && r.first > now() - IP_WINDOW); }
+  async loginFailed(ip, u) {
+    const t = now(), r = await this.db.q1('SELECT * FROM login_fail WHERE ip=?', [ip]);
+    if (!r || r.first < t - IP_WINDOW) await this.db.ex('INSERT INTO login_fail(ip,n,first) VALUES(?,1,?) ON CONFLICT(ip) DO UPDATE SET n=1, first=excluded.first', [ip, t]);
+    else await this.db.ex('UPDATE login_fail SET n=n+1 WHERE ip=?', [ip]);
+    if (u) {
+      const n = (u.failed_logins || 0) + 1;
+      if (n >= LOCK_AFTER) { await this.db.update('users', u.id, { failed_logins: 0, locked_until: t + LOCK_SECONDS }); await this.audit(u.name, 'login.locked', `${LOCK_AFTER} λάθος προσπάθειες από ${ip}`); }
+      else await this.db.update('users', u.id, { failed_logins: n });
+    }
   }
   async preflight(lat, lon, docks) {
     const w = await this.weather(lat, lon), wi = weatherIssues(w, await this.flightLimits());
@@ -607,6 +730,33 @@ class App {
     return { id: cam.id, name: cam.name, org_id: cam.org_id, org_name: org ? org.name : '', arming_mode: mode, org_armed: orgArmed,
       armed_now: mode === 'armed' || (mode !== 'disarmed' && !!orgArmed), enabled: cam.enabled, online: cam.online, caps: this.capsOf(cam),
       edge: edge ? { online: !!(edge.last_seen && now() - edge.last_seen < 120), version: edge.version } : null, recent };
+  }
+
+  // ---------------- no-fly zones imported from a file (normalised in the browser; same rules as server/features.py)
+  async importZones(zones, source, replace) {
+    need(Array.isArray(zones) && zones.length, 400, 'Δεν βρέθηκαν ζώνες στο αρχείο');
+    need(zones.length <= 5000, 400, 'Έως 5000 ζώνες ανά εισαγωγή');
+    source = String(source || 'εισαγωγή').trim().slice(0, 80);
+    const rows = [];
+    for (const z of zones) {
+      const name = String(z.name || 'Ζώνη').trim().slice(0, 120), level = z.level === 'block' ? 'block' : 'warn';
+      let geom = null, lat, lon, radius = 0;
+      if (z.geom) {
+        const pts = polygonsOf(z.geom).flat(2);
+        if (!pts.length || pts.length > 20000 || !pts.every(q => Math.abs(q[0]) <= 180 && Math.abs(q[1]) <= 90)) continue;
+        geom = JSON.stringify(z.geom);
+        lon = pts.reduce((a, q) => a + q[0], 0) / pts.length; lat = pts.reduce((a, q) => a + q[1], 0) / pts.length;
+        radius = Math.max(...pts.map(q => haversine(lat, lon, q[1], q[0])));
+      } else if (z.lat != null && z.radius_m) { lat = +z.lat; lon = +z.lon; radius = +z.radius_m; }
+      else continue;
+      rows.push({ name, lat, lon, radius_m: Math.round(radius), level, geom, notes: String(z.notes || '').slice(0, 500), source, ext_id: String(z.ext_id || '').slice(0, 80), enabled: 1 });
+    }
+    need(rows.length, 400, 'Καμία έγκυρη ζώνη (χρειάζονται πολύγωνα ή κύκλοι με συντεταγμένες WGS84)');
+    const stmts = [];
+    if (replace) stmts.push(this.env.DB.prepare('DELETE FROM nofly WHERE source=?').bind(source));
+    for (const r of rows) { const k = Object.keys(r); stmts.push(this.env.DB.prepare(`INSERT INTO nofly(${k.join(',')}) VALUES(${k.map(() => '?').join(',')})`).bind(...k.map(x => r[x]))); }
+    for (let i = 0; i < stmts.length; i += 100) await this.env.DB.batch(stmts.slice(i, i + 100));
+    return rows.length;
   }
 
   // ---------------- statistics
@@ -778,16 +928,31 @@ class App {
     if (p.startsWith('/webhook/')) return this.webhook(p);
     if (p.startsWith('/media/')) { await this.user(); return this.serveMedia(decodeURIComponent(p.slice(7))); }
     let m;
-    if ((m = p.match(/^\/report\/(\d+)$/))) {
-      const u = await this.user(); const inc = await this.incidentView(+m[1]); need(inc, 404, 'Δεν βρέθηκε');
+    // the page builds the report from /api/incidents/{id}/report (static/report.js, shared with the Python server)
+    if (p.match(/^\/report\/(\d+)$/)) return this.env.ASSETS.fetch(new Request(new URL('/static/report.html', this.url)));
+    if ((m = p.match(/^\/api\/incidents\/(\d+)\/report$/))) {
+      const u = await this.user(), iid = +m[1], inc = await this.incidentView(iid); need(inc, 404, 'Δεν βρέθηκε');
       const vis = await this.visible(u); need(!vis || vis.has(inc.org_id), 404, 'Δεν βρέθηκε');
-      return new Response(reportHtml(inc), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      inc.events = await this.db.q('SELECT e.ts, e.type, e.raw_type, e.target, e.state, e.source, e.image, e.clip, c.name AS camera FROM events e LEFT JOIN cameras c ON c.id=e.camera_id WHERE e.incident_id=? ORDER BY e.ts', [iid]);
+      inc.missions = []; for (const x of await this.db.q('SELECT * FROM missions WHERE incident_id=? ORDER BY id', [iid])) inc.missions.push(await this.missionView(x));
+      inc.center = await this.db.q1("SELECT name, address FROM orgs WHERE kind='center' ORDER BY id LIMIT 1");
+      inc.types = Object.fromEntries(Object.entries(TYPES).map(([k, v]) => [k, v[0]]));
+      Object.assign(inc, { generated: now(), generated_by: u.name });
+      return json(inc);
     }
     if (p.startsWith('/api/edge/')) return this.edge(p);
     if (p === '/api/login' && method === 'POST') {
-      const b = await this.body();
+      const b = await this.body(), ip = this.req.headers.get('CF-Connecting-IP') || 'local';
+      need(!(await this.ipBlocked(ip)), 429, 'Πολλές αποτυχημένες προσπάθειες. Δοκιμάστε ξανά σε 15 λεπτά.');
       const u = await this.db.q1('SELECT * FROM users WHERE username=? AND active=1', [b.username || '']);
-      if (!u || !(await checkPw(b.password || '', u.pw_hash))) { await new Promise(r => setTimeout(r, 600)); throw new ApiError(401, 'Λάθος όνομα χρήστη ή κωδικός'); }
+      if (u && u.locked_until && u.locked_until > now())
+        throw new ApiError(423, `Ο λογαριασμός κλειδώθηκε μετά από πολλές λάθος προσπάθειες, έως ${fmtTime(u.locked_until, { hour: '2-digit', minute: '2-digit' })}. Ο διαχειριστής μπορεί να τον ξεκλειδώσει.`);
+      if (!u || !(await checkPw(b.password || '', u.pw_hash))) { await this.loginFailed(ip, u); await new Promise(r => setTimeout(r, 600)); throw new ApiError(401, 'Λάθος όνομα χρήστη ή κωδικός'); }
+      if (u.totp_on) {
+        if (!b.code) return json({ ok: false, need_2fa: true, error: 'Δώστε τον 6ψήφιο κωδικό από την εφαρμογή επαλήθευσης' }, 401);
+        if (!(await totpOk(u.totp_secret, b.code))) { await this.loginFailed(ip, u); await new Promise(r => setTimeout(r, 600)); return json({ ok: false, need_2fa: true, error: 'Λάθος κωδικός επαλήθευσης' }, 401); }
+      }
+      if (u.failed_logins || u.locked_until) await this.db.update('users', u.id, { failed_logins: 0, locked_until: null });
       const tok = rnd(32); await this.db.ex('INSERT INTO sessions(token,user_id,expires) VALUES(?,?,?)', [tok, u.id, now() + 12 * 3600]);
       await this.db.ex('DELETE FROM sessions WHERE expires<?', [now()]);
       await this.audit(u.name, 'login');
@@ -795,7 +960,30 @@ class App {
       return json({ ok: true }, 200, { 'Set-Cookie': `c2d=${tok}; HttpOnly;${secure} SameSite=Strict; Path=/; Max-Age=43200` });
     }
     if (p === '/api/logout' && method === 'POST') { await this.db.ex('DELETE FROM sessions WHERE token=?', [this.cookie('c2d')]); return json({ ok: true }, 200, { 'Set-Cookie': 'c2d=; Path=/; Max-Age=0' }); }
-    if (p === '/api/me') { const u = await this.user(); return json({ id: u.id, username: u.username, name: u.name, role: u.role, org_id: u.org_id, version: VERSION, platform: 'cloudflare' }); }
+    if (p === '/api/me') { const u = await this.user(); return json({ id: u.id, username: u.username, name: u.name, role: u.role, org_id: u.org_id, version: VERSION, platform: 'cloudflare', totp_on: !!u.totp_on }); }
+    if (['/api/2fa/setup', '/api/2fa/enable', '/api/2fa/disable'].includes(p) && method === 'POST') {
+      const u = await this.user(), b = await this.body();
+      if (p.endsWith('setup')) {
+        need(!u.totp_on, 409, 'Η επαλήθευση 2 βημάτων είναι ήδη ενεργή');
+        const secret = b32(crypto.getRandomValues(new Uint8Array(20)));
+        await this.db.update('users', u.id, { totp_secret: secret });
+        return json({ ok: true, secret, uri: `otpauth://totp/SKYWARDEN:${encodeURIComponent(u.username)}?secret=${secret}&issuer=SKYWARDEN&digits=6&period=30` });
+      }
+      if (p.endsWith('enable')) {
+        need(u.totp_secret && await totpOk(u.totp_secret, b.code), 400, 'Λάθος κωδικός. Ελέγξτε ότι η ώρα του κινητού είναι σωστή.');
+        await this.db.update('users', u.id, { totp_on: 1 }); await this.audit(u.name, '2fa.enable'); return json({ ok: true });
+      }
+      need(await checkPw(b.password || '', u.pw_hash), 400, 'Λάθος κωδικός πρόσβασης');
+      need(await totpOk(u.totp_secret, b.code), 400, 'Λάθος κωδικός επαλήθευσης');
+      await this.db.update('users', u.id, { totp_on: 0, totp_secret: null }); await this.audit(u.name, '2fa.disable'); return json({ ok: true });
+    }
+    if (p === '/api/nofly') { await this.user(true, STAFF); return json(await this.db.q('SELECT id,name,lat,lon,radius_m,level,geom FROM nofly WHERE enabled=1')); }
+    if (p === '/api/admin/nofly/import' && method === 'POST') {
+      const u = await this.user(true, ['admin']), b = await this.body();
+      const n = await this.importZones(b.zones, b.source, !!b.replace);
+      await this.audit(u.name, 'nofly.import', `${n} ζώνες · ${b.source || ''}`);
+      return json({ ok: true, imported: n });
+    }
     if (p === '/api/password' && method === 'POST') {
       const u = await this.user(), b = await this.body();
       need(await checkPw(b.old || '', u.pw_hash), 400, 'Λάθος τρέχων κωδικός');
@@ -813,7 +1001,7 @@ class App {
       let missions = [];
       for (const mm of await this.db.q('SELECT m.*, i.org_id AS inc_org FROM missions m JOIN incidents i ON i.id=m.incident_id WHERE m.landed_ts IS NULL'))
         if (!vis || vis.has(mm.inc_org)) missions.push(await this.missionView(mm));
-      const extra = vis ? {} : { on_duty: await this.onDuty(), nofly: await this.db.q('SELECT id,name,lat,lon,radius_m,level FROM nofly WHERE enabled=1') };
+      const extra = vis ? {} : { on_duty: await this.onDuty(), nofly_ver: await (async () => { const r = await this.db.q1('SELECT COUNT(*) AS n, COALESCE(MAX(id),0) AS m FROM nofly WHERE enabled=1'); return `${r.n}:${r.m}`; })() };
       return json({ orgs, docks, missions, ...extra, incidents: await this.incidentList(vis), server_time: now(), types: Object.fromEntries(Object.entries(TYPES).map(([k, v]) => [k, v[0]])) });
     }
     if ((m = p.match(/^\/api\/incidents\/(\d+)$/)) && method === 'GET') {
@@ -942,6 +1130,7 @@ class App {
   async edge(p) {
     const edge = await this.db.q1('SELECT * FROM edges WHERE token=?', [this.bearer() || '']); need(edge, 401, 'Άγνωστο κουτί (token)');
     await this.db.update('edges', edge.id, { last_seen: now(), ip: this.req.headers.get('CF-Connecting-IP') || '' });
+    await this.edgeSeen(edge);
     const hdr = k => this.req.headers.get(k) || '';
     if (p === '/api/edge/agent') return new Response(AGENT.code, { headers: { 'Content-Type': 'text/x-python; charset=utf-8', 'X-Agent-Version': AGENT.version, 'X-Agent-Sha256': AGENT.sha256, 'Cache-Control': 'no-store' } });
     if (p === '/api/edge/frame') {
@@ -971,6 +1160,7 @@ class App {
         const upd = { last_seen: now(), online: c.online === false ? 0 : 1, edge_id: edge.id };
         if (c.caps && typeof c.caps === 'object' && !Array.isArray(c.caps)) upd.caps = JSON.stringify(c.caps).slice(0, 8000); // ONVIF capabilities
         await this.db.update('cameras', cam.id, upd);
+        await this.cameraState(edge, cam, c.online !== false);
       }
       if (edge.update_requested && b.version === AGENT.version) { await this.db.update('edges', edge.id, { update_requested: 0 }); edge.update_requested = 0; }
       return json(await this.edgePoll(edge));
@@ -981,8 +1171,9 @@ class App {
   async admin(method, table, id) {
     const u = await this.user(true, method === 'GET' ? ['admin', 'supervisor'] : ['admin']);
     if (table === 'settings') {
-      if (method === 'GET') { const em = await this.db.setting('email', {}) || {}, md = await this.mediaCfg(); return json({ flight: await this.flightLimits(), media: { publish: md.publish || '', play: md.play || '' }, sms: await this.db.setting('sms', {}), email: em, platform: 'cloudflare', r2: !!this.env.MEDIA }); }
+      if (method === 'GET') { const em = await this.db.setting('email', {}) || {}, md = await this.mediaCfg(); return json({ flight: await this.flightLimits(), retention_days: await this.retentionDays(), media: { publish: md.publish || '', play: md.play || '' }, sms: await this.db.setting('sms', {}), email: em, platform: 'cloudflare', r2: !!this.env.MEDIA }); }
       const b = await this.body();
+      if ('retention_days' in b) { const d = Math.round(Number(b.retention_days)); need(Number.isFinite(d), 400, 'Ημέρες διατήρησης: αριθμός'); await this.db.setSetting('retention_days', Math.max(0, Math.min(3650, d))); }
       if (b.media) {
         const old = await this.mediaCfg(), pub = String(b.media.publish || '').trim(), play = String(b.media.play || '').trim();
         need(!pub || (/^(rtsps?|rtmps?|srt):\/\//.test(pub) && pub.includes('{path}')), 400, 'Η διεύθυνση αποστολής πρέπει να είναι rtsp/rtmp/srt και να περιέχει {path}');
@@ -1004,7 +1195,7 @@ class App {
     if (method === 'GET') {
       const rows = await this.db.q(`SELECT * FROM ${table} ORDER BY id`);
       for (const r of rows) {
-        delete r.pw_hash;
+        delete r.pw_hash; delete r.totp_secret;
         if (table === 'users') r.api_token = String(r.api_token || '').slice(0, 6) + '…';
         if (table === 'edges') { r.token = String(r.token || '').slice(0, 6) + '…'; r.cameras = (await this.db.q1('SELECT COUNT(*) AS n FROM cameras WHERE edge_id=?', [r.id])).n; r.agent_latest = AGENT.version; }
         if (table === 'orgs') { r.webhook_url = r.kind === 'customer' ? `/webhook/${r.webhook_token}` : ''; delete r.webhook_token; }
@@ -1032,6 +1223,8 @@ class App {
     if (method === 'PUT') {
       need(id, 400, 'Λείπει id');
       if (table === 'edges' && b.request_update) data.update_requested = 1;
+      if (table === 'users' && b.reset_2fa) Object.assign(data, { totp_on: 0, totp_secret: null });
+      if (table === 'users' && b.unlock) Object.assign(data, { locked_until: null, failed_logins: 0 });
       if (table === 'edges' && b.regenerate_token) extra.token = data.token = rnd(24);
       await this.db.update(table, +id, data); await this.audit(u.name, `${table}.update`, id);
       return json({ ok: true, ...extra });
@@ -1110,6 +1303,15 @@ table{border-collapse:collapse;width:100%;font-size:14px}td,th{border-bottom:1px
 <tr><th>Drone</th><td>${m ? escH(m.dock.name + ' · ' + (m.simulated ? 'προσομοίωση' : 'DJI Dock')) : 'Δεν στάλθηκε'}</td></tr>
 <tr><th>Αποτέλεσμα</th><td>${escH(inc.outcome || 'Ανοιχτό')}</td></tr><tr><th>Σημείωση</th><td>${escH(inc.note)}</td></tr><tr><th>Κλείσιμο</th><td>${f(inc.closed_ts)}</td></tr></table>
 <h2>Εικόνες</h2><div class="imgs">${imgs || '<p>Δεν υπάρχουν εικόνες.</p>'}</div><h2>Χρονολόγιο</h2><table>${tl}</table></body></html>`;
+}
+
+// Cron (a separate small Worker, see cloudflare/cron): escalation, drone phases, offline boxes every minute, old media hourly.
+export async function scheduled(env, ctx) {
+  const app = new App(env, new Request((env.SITE_ORIGIN || 'https://cam2drone.pages.dev') + '/cron'), ctx);
+  await app.tick();
+  await app.offlineCheck();
+  const last = await app.db.setting('retention_last', 0);
+  if (now() - (last || 0) > 3600) { await app.db.setSetting('retention_last', now()); await app.retentionRun(); }
 }
 
 export async function handle(context) {

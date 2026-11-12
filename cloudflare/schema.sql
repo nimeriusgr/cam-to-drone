@@ -11,18 +11,19 @@ CREATE TABLE IF NOT EXISTS contacts(
   notify_sms INTEGER DEFAULT 1, notify_email INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS edges(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, name TEXT NOT NULL, token TEXT UNIQUE NOT NULL,
-  last_seen REAL, version TEXT DEFAULT '', ip TEXT DEFAULT '', update_requested INTEGER DEFAULT 0);
+  last_seen REAL, version TEXT DEFAULT '', ip TEXT DEFAULT '', update_requested INTEGER DEFAULT 0, offline_since REAL);
 CREATE TABLE IF NOT EXISTS cameras(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, edge_id INTEGER, ext_key TEXT NOT NULL,
   name TEXT NOT NULL, lat REAL, lon REAL, enabled INTEGER DEFAULT 1, snooze_until REAL,
-  last_seen REAL, online INTEGER DEFAULT 1, arming_mode TEXT DEFAULT 'inherit', caps TEXT, UNIQUE(org_id, ext_key));
+  last_seen REAL, online INTEGER DEFAULT 1, arming_mode TEXT DEFAULT 'inherit', caps TEXT, offline_since REAL, UNIQUE(org_id, ext_key));
 CREATE TABLE IF NOT EXISTS docks(
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
   radius_km REAL DEFAULT 5, adapter TEXT DEFAULT 'sim', serial TEXT DEFAULT '',
   has_speaker INTEGER DEFAULT 1, has_light INTEGER DEFAULT 1, enabled INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL,
-  org_id INTEGER, pw_hash TEXT NOT NULL, api_token TEXT UNIQUE, active INTEGER DEFAULT 1);
+  org_id INTEGER, pw_hash TEXT NOT NULL, api_token TEXT UNIQUE, active INTEGER DEFAULT 1,
+  totp_secret TEXT, totp_on INTEGER DEFAULT 0, failed_logins INTEGER DEFAULT 0, locked_until REAL);
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS incidents(
   id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL, camera_id INTEGER, status TEXT NOT NULL DEFAULT 'new',
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS shifts(
   id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, start_ts REAL NOT NULL, end_ts REAL, handover TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS nofly(
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL, radius_m REAL NOT NULL DEFAULT 1000,
-  level TEXT DEFAULT 'block', notes TEXT DEFAULT '', enabled INTEGER DEFAULT 1);
+  level TEXT DEFAULT 'block', notes TEXT DEFAULT '', enabled INTEGER DEFAULT 1, geom TEXT, source TEXT DEFAULT '', ext_id TEXT);
 CREATE TABLE IF NOT EXISTS push_subs(
   id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, endpoint TEXT UNIQUE NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL, ts REAL);
 CREATE TABLE IF NOT EXISTS live_req(camera_id INTEGER PRIMARY KEY, until REAL NOT NULL);
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS cam_commands(
   id INTEGER PRIMARY KEY, camera_id INTEGER NOT NULL, edge_id INTEGER NOT NULL, cmd TEXT NOT NULL, args TEXT DEFAULT '{}',
   status TEXT NOT NULL DEFAULT 'pending', result TEXT, who TEXT, created REAL NOT NULL, sent_ts REAL, done_ts REAL);
 CREATE INDEX IF NOT EXISTS ix_cmd_edge ON cam_commands(edge_id, status);
+CREATE TABLE IF NOT EXISTS login_fail(ip TEXT PRIMARY KEY, n INTEGER NOT NULL, first REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS ix_inc_first ON incidents(first_ts);
 CREATE INDEX IF NOT EXISTS ix_ev_cam ON events(camera_id, ts);
 CREATE INDEX IF NOT EXISTS ix_shift_open ON shifts(end_ts);

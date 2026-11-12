@@ -12,6 +12,7 @@
       navigator.serviceWorker.addEventListener('message', e => { if (e.data && e.data.open) openFromUrl(e.data.open); });
     }
     $('#pushBtn').onclick = () => { $('#userMenu').hidden = true; pushModal(); };
+    $('#tfaBtn').onclick = () => { $('#userMenu').hidden = true; tfaModal(); };
     if (isStaff()) { $('#shiftBtn').onclick = shiftModal; await loadShift(); }
     openFromUrl(location.href);
     window.addEventListener('hashchange', () => openFromUrl(location.href));
@@ -313,6 +314,31 @@
       const box = $('#cLiveBox');
       if (F.liveCam()) { F.stopLive(); box.hidden = true; lb.textContent = 'Προβολή'; } else { box.hidden = false; F.startLive(liveCam.id, box); lb.textContent = 'Τέλος'; }
     };
+  }
+
+  /* ================================================================ two-step login (TOTP: Google Authenticator, Microsoft Authenticator, Authy...) */
+  const loadQr = () => window.QRCode ? Promise.resolve() : new Promise((ok, no) => {
+    const s = document.createElement('script'); s.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js'; s.onload = ok; s.onerror = no; document.head.appendChild(s);
+  });
+  async function tfaModal() {
+    const me = await api('/api/me');
+    if (me.totp_on) {
+      return modal(`<h2>Επαλήθευση 2 βημάτων: ενεργή</h2><p class="mut">Για απενεργοποίηση δώστε τον κωδικό πρόσβασης και έναν τρέχοντα κωδικό από την εφαρμογή.</p>
+        <label for="tfP">Κωδικός πρόσβασης</label><input id="tfP" type="password" autocomplete="current-password">
+        <label for="tfC">Κωδικός επαλήθευσης</label><input id="tfC" inputmode="numeric" autocomplete="one-time-code" maxlength="7">`,
+        'Απενεργοποίηση', async () => { await api('/api/2fa/disable', { password: $('#tfP').value, code: $('#tfC').value }); toast('Η επαλήθευση 2 βημάτων απενεργοποιήθηκε'); });
+    }
+    const st = await api('/api/2fa/setup', {});
+    modal(`<h2>Επαλήθευση 2 βημάτων</h2>
+      <p class="mut">Στη σύνδεση θα ζητείται, εκτός από τον κωδικό, και ένας 6ψήφιος κωδικός από εφαρμογή στο κινητό σας (Google Authenticator, Microsoft Authenticator, Authy).</p>
+      <ol class="tfa-steps"><li>Ανοίξτε την εφαρμογή και σκανάρετε τον κωδικό QR:</li></ol>
+      <div class="tfa-qr" id="tfQr"></div>
+      <p class="mut small">Ή γράψτε χειροκίνητα το κλειδί: <code style="user-select:all">${esc(st.secret.replace(/(.{4})/g, '$1 ').trim())}</code></p>
+      <ol class="tfa-steps" start="2"><li>Γράψτε τον κωδικό που εμφανίζει η εφαρμογή:</li></ol>
+      <input id="tfC" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="123456">`,
+      'Ενεργοποίηση', async () => { await api('/api/2fa/enable', { code: $('#tfC').value }); toast('Η επαλήθευση 2 βημάτων ενεργοποιήθηκε'); });
+    try { await loadQr(); new QRCode($('#tfQr'), { text: st.uri, width: 180, height: 180, colorDark: '#000000', colorLight: '#ffffff' }); }
+    catch { $('#tfQr').innerHTML = '<p class="mut">Ο κωδικός QR δεν φορτώθηκε. Χρησιμοποιήστε το κλειδί από κάτω.</p>'; }
   }
 
   /* ================================================================ camera control panel: arming + ONVIF commands */

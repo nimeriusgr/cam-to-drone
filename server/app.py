@@ -385,6 +385,7 @@ class Handler(BaseHTTPRequestHandler):
             edge = db.q1("SELECT * FROM edges WHERE token=?", (self.bearer(),))
             need(edge, 401, "Άγνωστο κουτί (token)")
             db.update("edges", edge["id"], {"last_seen": time.time(), "ip": self.client_address[0]})
+            features.edge_seen(edge)
             if path == "/api/edge/event" and method == "POST":
                 b = self.json_body()
                 need(b.get("camera_key"), 400, "Λείπει camera_key")
@@ -403,6 +404,7 @@ class Handler(BaseHTTPRequestHandler):
                     if isinstance(c.get("caps"), dict):  # what the camera supports over ONVIF (PTZ, presets, outputs, day/night)
                         upd["caps"] = json.dumps(c["caps"], ensure_ascii=False)[:8000]
                     db.update("cameras", cam["id"], upd)
+                    features.camera_state(edge, cam, c.get("online", True) is not False)
                     if was != int(bool(c.get("online", True))):
                         logic.publish("camera", org_id=edge["org_id"], id=cam["id"], online=bool(c.get("online", True)))
                 ag = features.agent_info(meta_only=True)
@@ -442,10 +444,24 @@ class Handler(BaseHTTPRequestHandler):
         # auth
         if path == "/api/login" and method == "POST":
             b = self.json_body()
+            ip = self.client_address[0]
+            need(not features.ip_blocked(ip), 429, "Πολλές αποτυχημένες προσπάθειες. Δοκιμάστε ξανά σε 15 λεπτά.")
             u = db.q1("SELECT * FROM users WHERE username=? AND active=1", (b.get("username", ""),))
+            if u and u.get("locked_until") and u["locked_until"] > time.time():
+                raise ApiError(423, "Ο λογαριασμός κλειδώθηκε μετά από πολλές λάθος προσπάθειες, έως "
+                               + features.local(u["locked_until"]).strftime("%H:%M") + ". Ο διαχειριστής μπορεί να τον ξεκλειδώσει.")
             if not u or not logic.check_pw(b.get("password", ""), u["pw_hash"]):
+                features.login_failed(ip, u)
                 time.sleep(0.7)
                 raise ApiError(401, "Λάθος όνομα χρήστη ή κωδικός")
+            if u.get("totp_on"):
+                if not b.get("code"):
+                    return self.send(401, {"ok": False, "need_2fa": True, "error": "Δώστε τον 6ψήφιο κωδικό από την εφαρμογή επαλήθευσης"})
+                if not features.totp_ok(u["totp_secret"], b["code"]):
+                    features.login_failed(ip, u)
+                    time.sleep(0.7)
+                    return self.send(401, {"ok": False, "need_2fa": True, "error": "Λάθος κωδικός επαλήθευσης"})
+            features.login_ok(u)
             tok = logic.new_session(u["id"])
             logic.audit(u["name"], "login")
             return self.send(200, {"ok": True}, headers={"Set-Cookie": f"c2d={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200"})
@@ -454,7 +470,37 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {"ok": True}, headers={"Set-Cookie": "c2d=; Path=/; Max-Age=0"})
         if path == "/api/me":
             u = self.user()
-            return self.send(200, {k: u[k] for k in ("id", "username", "name", "role", "org_id")} | {"version": VERSION, "platform": "python"})
+            return self.send(200, {k: u[k] for k in ("id", "username", "name", "role", "org_id")} | {"version": VERSION, "platform": "python", "totp_on": bool(u.get("totp_on"))})
+        if path in ("/api/2fa/setup", "/api/2fa/enable", "/api/2fa/disable") and method == "POST":
+            u = self.user()
+            b = self.json_body()
+            if path.endswith("setup"):
+                need(not u.get("totp_on"), 409, "Η επαλήθευση 2 βημάτων είναι ήδη ενεργή")
+                secret = features.totp_new()
+                db.update("users", u["id"], {"totp_secret": secret})
+                return self.send(200, {"ok": True, "secret": secret, "uri": features.totp_uri(u, secret)})
+            if path.endswith("enable"):
+                need(u.get("totp_secret") and features.totp_ok(u["totp_secret"], b.get("code")), 400, "Λάθος κωδικός. Ελέγξτε ότι η ώρα του κινητού είναι σωστή.")
+                db.update("users", u["id"], {"totp_on": 1})
+                logic.audit(u["name"], "2fa.enable")
+                return self.send(200, {"ok": True})
+            need(logic.check_pw(b.get("password", ""), u["pw_hash"]), 400, "Λάθος κωδικός πρόσβασης")
+            need(features.totp_ok(u.get("totp_secret"), b.get("code")), 400, "Λάθος κωδικός επαλήθευσης")
+            db.update("users", u["id"], {"totp_on": 0, "totp_secret": None})
+            logic.audit(u["name"], "2fa.disable")
+            return self.send(200, {"ok": True})
+        if path == "/api/nofly":
+            self.user(roles=features.STAFF)
+            return self.send(200, db.q("SELECT id,name,lat,lon,radius_m,level,geom FROM nofly WHERE enabled=1"))
+        if path == "/api/admin/nofly/import" and method == "POST":
+            u = self.user(roles={"admin"})
+            b = self.json_body()
+            try:
+                n = features.import_zones(b.get("zones"), b.get("source"), bool(b.get("replace")))
+            except ValueError as e:
+                raise ApiError(400, str(e))
+            logic.audit(u["name"], "nofly.import", f"{n} ζώνες · {b.get('source') or ''}")
+            return self.send(200, {"ok": True, "imported": n})
         if path == "/api/password" and method == "POST":
             u = self.user()
             b = self.json_body()
@@ -484,7 +530,7 @@ class Handler(BaseHTTPRequestHandler):
             if vis is not None:
                 flying = [f for f in flying if db.q1("SELECT org_id FROM incidents WHERE id=?", (f["incident_id"],))["org_id"] in vis]
             extra = {} if vis is not None else {"on_duty": features.on_duty(),
-                                                "nofly": db.q("SELECT id,name,lat,lon,radius_m,level FROM nofly WHERE enabled=1")}
+                                                "nofly_ver": "%s:%s" % tuple(db.q1("SELECT COUNT(*) AS n, COALESCE(MAX(id),0) AS m FROM nofly WHERE enabled=1").values())}
             return self.send(200, {"orgs": orgs, "docks": docks, "missions": flying, **extra,
                                    "incidents": logic.incident_list(vis), "server_time": time.time(),
                                    "types": {k: v[0] for k, v in logic.TYPES.items()}})
@@ -524,13 +570,23 @@ class Handler(BaseHTTPRequestHandler):
             logic.add_timeline(iid, f"Μεγάφωνο: φωνητικό μήνυμα ελεγκτή ({secs}″)", u["name"], "speaker")
             return self.send(200, {"ok": True, "file": name})
         m = re.fullmatch(r"/report/(\d+)", path)
+        if m:  # the page builds the report from /api/incidents/{id}/report (static/report.js, shared with Cloudflare)
+            return self.file(os.path.join(STATIC, "report.html"), "text/html; charset=utf-8")
+        m = re.fullmatch(r"/api/incidents/(\d+)/report", path)
         if m:
             u = self.user()
-            inc = logic.incident_view(int(m.group(1)))
+            iid = int(m.group(1))
+            inc = logic.incident_view(iid)
             need(inc, 404, "Δεν βρέθηκε")
             vis = logic.visible_org_ids(u)
             need(vis is None or inc["org_id"] in vis, 404, "Δεν βρέθηκε")
-            return self.send(200, report_html(inc), "text/html; charset=utf-8")
+            inc["events"] = db.q("SELECT e.ts, e.type, e.raw_type, e.target, e.state, e.source, e.image, e.clip, c.name AS camera FROM events e "
+                                 "LEFT JOIN cameras c ON c.id=e.camera_id WHERE e.incident_id=? ORDER BY e.ts", (iid,))
+            inc["missions"] = [logic.mission_view(x) for x in db.q("SELECT * FROM missions WHERE incident_id=? ORDER BY id", (iid,))]
+            inc["center"] = db.q1("SELECT name, address FROM orgs WHERE kind='center' ORDER BY id LIMIT 1")
+            inc["types"] = {k: v[0] for k, v in logic.TYPES.items()}
+            inc.update(generated=time.time(), generated_by=u["name"])
+            return self.send(200, inc)
 
         # Postman / integrations
         if path == "/api/command" and method == "POST":
@@ -668,11 +724,17 @@ class Handler(BaseHTTPRequestHandler):
         if table == "settings":
             if method == "GET":
                 media = features.media_cfg()
-                return self.send(200, {"flight": features.flight_limits(), "media": {"publish": media.get("publish", ""), "play": media.get("play", "")},
+                return self.send(200, {"flight": features.flight_limits(), "retention_days": features.retention_days(),
+                                       "media": {"publish": media.get("publish", ""), "play": media.get("play", "")},
                                        "sms": db.setting("sms", {}), "smtp": {**(db.setting("smtp", {}) or {}), "password": "••••" if (db.setting("smtp", {}) or {}).get("password") else ""}})
             b = self.json_body()
             if "sms" in b:
                 db.set_setting("sms", b["sms"])
+            if "retention_days" in b:
+                try:
+                    db.set_setting("retention_days", max(0, min(3650, int(b["retention_days"]))))
+                except (TypeError, ValueError):
+                    raise ApiError(400, "Ημέρες διατήρησης: αριθμός")
             if "media" in b:
                 old = features.media_cfg()
                 pub, play = str(b["media"].get("publish") or "").strip(), str(b["media"].get("play") or "").strip()
@@ -705,6 +767,7 @@ class Handler(BaseHTTPRequestHandler):
             rows = db.q(f"SELECT * FROM {table} ORDER BY id")
             for r in rows:
                 r.pop("pw_hash", None)
+                r.pop("totp_secret", None)
                 if table == "users":
                     r["api_token"] = (r.get("api_token") or "")[:6] + "…"
                 if table == "edges":
@@ -749,6 +812,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {"ok": True, "id": new_id, **extra})
         if method == "PUT":
             need(id_, 400, "Λείπει id")
+            if table == "users" and b.get("reset_2fa"):
+                data.update(totp_on=0, totp_secret=None)
+            if table == "users" and b.get("unlock"):
+                data.update(locked_until=None, failed_logins=0)
             if table == "edges" and b.get("request_update"):
                 data["update_requested"] = 1
             if table == "edges" and b.get("regenerate_token"):
@@ -830,6 +897,19 @@ def main():
     logic.HOOKS["push"] = features.push
     created = seed.run()
     threading.Thread(target=logic.ticker, daemon=True).start()
+
+    def housekeeping():  # offline boxes every 30 s, old media once an hour
+        n = 0
+        while True:
+            time.sleep(30)
+            try:
+                features.offline_check()
+                if n % 120 == 0:
+                    features.retention_run()
+            except Exception as e:  # noqa: BLE001
+                print("[housekeeping]", e)
+            n += 1
+    threading.Thread(target=housekeeping, daemon=True).start()
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     srv.daemon_threads = True
     print(f"Cam to Drone {VERSION}")

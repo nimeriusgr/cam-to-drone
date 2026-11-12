@@ -30,6 +30,8 @@
       <p class="mut">Κέντρο ελέγχου συναγερμών</p>
       <label for="lu">Χρήστης</label><input id="lu" autocomplete="username" autocapitalize="none" spellcheck="false" required>
       <label for="lp">Κωδικός</label><input id="lp" type="password" autocomplete="current-password" required>
+      <div id="l2" hidden><label for="lc">Κωδικός επαλήθευσης (6 ψηφία από την εφαρμογή)</label>
+        <input id="lc" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="7"></div>
       <div class="err" id="lerr" role="alert"></div>
       <button class="btn pri wide" type="submit">Σύνδεση</button>
       <p class="fine">Πρόσβαση μόνο για εξουσιοδοτημένους χρήστες. Κάθε ενέργεια καταγράφεται.</p>
@@ -57,6 +59,7 @@
       <div class="menu" id="userMenu" hidden>
         <div class="mut" id="userName"></div>
         <button id="pushBtn">Ειδοποιήσεις σε αυτή τη συσκευή</button>
+        <button id="tfaBtn">Επαλήθευση 2 βημάτων</button>
         <button id="pwBtn">Αλλαγή κωδικού</button>
         <button id="logoutBtn">Αποσύνδεση</button>
       </div>

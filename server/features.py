@@ -266,13 +266,66 @@ def _seg_dist_m(lat1, lon1, lat2, lon2, plat, plon):
     return math.hypot(ax + t * dx, ay + t * dy)
 
 
+def polygons_of(geom):
+    """GeoJSON Polygon / MultiPolygon -> list of polygons, each a list of rings [[lon, lat], ...]."""
+    if not geom:
+        return []
+    g = json.loads(geom) if isinstance(geom, str) else geom
+    if g.get("type") == "Polygon":
+        return [g["coordinates"]]
+    if g.get("type") == "MultiPolygon":
+        return list(g["coordinates"])
+    return []
+
+
+def _in_ring(x, y, ring):
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i][0], ring[i][1]
+        xj, yj = ring[j][0], ring[j][1]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def in_polygons(lon, lat, polys):
+    return any(_in_ring(lon, lat, p[0]) and not any(_in_ring(lon, lat, h) for h in p[1:]) for p in polys if p)
+
+
+def _cross(a, b, c, d):
+    def orient(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+    return (orient(a, b, c) > 0) != (orient(a, b, d) > 0) and (orient(c, d, a) > 0) != (orient(c, d, b) > 0)
+
+
+def path_hits_polygons(a, b, polys):
+    """a, b = (lon, lat). True if either end is inside or the straight path crosses an edge."""
+    if in_polygons(a[0], a[1], polys) or in_polygons(b[0], b[1], polys):
+        return True
+    for p in polys:
+        for ring in p:
+            for i in range(len(ring) - 1):
+                if _cross(a, b, ring[i], ring[i + 1]):
+                    return True
+    return False
+
+
 def zone_issues(dock, lat, lon):
     out = []
     for z in db.q("SELECT * FROM nofly WHERE enabled=1"):
         lvl = "block" if z["level"] == "block" else "warn"
-        if logic.haversine_m(z["lat"], z["lon"], lat, lon) <= z["radius_m"]:
+        polys = polygons_of(z.get("geom"))
+        if polys:
+            inside = in_polygons(lon, lat, polys)
+            path = not inside and dock and path_hits_polygons((dock["lon"], dock["lat"]), (lon, lat), polys)
+        else:
+            inside = logic.haversine_m(z["lat"], z["lon"], lat, lon) <= z["radius_m"]
+            path = not inside and dock and _seg_dist_m(dock["lat"], dock["lon"], lat, lon, z["lat"], z["lon"]) <= z["radius_m"]
+        if inside:
             out.append({"level": lvl, "text": f"Ο στόχος είναι μέσα στη ζώνη «{z['name']}»", "zone_id": z["id"]})
-        elif dock and _seg_dist_m(dock["lat"], dock["lon"], lat, lon, z["lat"], z["lon"]) <= z["radius_m"]:
+        elif path:
             out.append({"level": lvl, "text": f"Η διαδρομή από {dock['name']} περνά από τη ζώνη «{z['name']}»", "zone_id": z["id"]})
     return out
 
@@ -596,3 +649,182 @@ def camera_control(cam):
             "enabled": cam["enabled"], "online": cam["online"], "caps": caps_of(cam),
             "edge": {"online": bool(edge and edge["last_seen"] and time.time() - edge["last_seen"] < 120), "version": edge["version"]} if edge else None,
             "recent": [command_view(r["id"]) for r in db.q("SELECT id FROM cam_commands WHERE camera_id=? ORDER BY id DESC LIMIT 8", (cam["id"],))]}
+
+
+# ================================================================== technical alerts: box or camera stops answering
+EDGE_OFFLINE_AFTER = 180  # seconds without any request from the box
+
+
+def technical(org_id, cam_id, text):
+    """Adds to the open technical incident of the organisation, or opens one (priority 4) and notifies."""
+    now = time.time()
+    inc = db.q1("SELECT * FROM incidents WHERE org_id=? AND status!='closed' AND type IN ('offline','videoloss') ORDER BY id DESC LIMIT 1", (org_id,))
+    if inc:
+        cams = inc["cameras"]
+        if cam_id and cam_id not in cams:
+            cams.append(cam_id)
+        db.update("incidents", inc["id"], {"last_ts": now, "count": inc["count"] + 1, "cameras": cams})
+        logic.add_timeline(inc["id"], text, "σύστημα", "alarm")
+        return inc["id"]
+    iid = db.insert("incidents", {"org_id": org_id, "camera_id": cam_id, "status": "new", "priority": 4, "type": "offline",
+                                  "first_ts": now, "last_ts": now, "cameras": [cam_id] if cam_id else []})
+    logic.add_timeline(iid, text, "σύστημα", "alarm")
+    logic.publish("incident", org_id=org_id, id=iid, new=True, priority=4)
+    push("new", iid)
+    return iid
+
+
+def back_online(org_id, text):
+    inc = db.q1("SELECT id FROM incidents WHERE org_id=? AND status!='closed' AND type IN ('offline','videoloss') ORDER BY id DESC LIMIT 1", (org_id,))
+    if inc:
+        logic.add_timeline(inc["id"], text, "σύστημα", "info")
+
+
+def offline_check():
+    now = time.time()
+    for e in db.q("SELECT * FROM edges WHERE last_seen IS NOT NULL AND last_seen<? AND offline_since IS NULL", (now - EDGE_OFFLINE_AFTER,)):
+        db.update("edges", e["id"], {"offline_since": e["last_seen"]})
+        technical(e["org_id"], None, f"Το κουτί «{e['name']}» δεν επικοινωνεί από {local(e['last_seen']).strftime('%H:%M')} "
+                                     "(ρεύμα, internet ή βλάβη στην επιχείρηση)")
+
+
+def edge_seen(edge):
+    """Called on every request of a box: if it had been reported offline, note that it is back."""
+    if edge.get("offline_since"):
+        mins = int((time.time() - edge["offline_since"]) / 60)
+        db.update("edges", edge["id"], {"offline_since": None})
+        back_online(edge["org_id"], f"Το κουτί «{edge['name']}» επικοινωνεί ξανά (εκτός για περίπου {mins} λεπτά)")
+
+
+def camera_state(edge, cam, online):
+    """Heartbeat says whether the box can reach the camera."""
+    if not online and not cam.get("offline_since"):
+        db.update("cameras", cam["id"], {"offline_since": time.time()})
+        technical(edge["org_id"], cam["id"], f"Η κάμερα «{cam['name']}» δεν απαντά στο κουτί (ρεύμα, καλώδιο ή βλάβη κάμερας)")
+    elif online and cam.get("offline_since"):
+        db.update("cameras", cam["id"], {"offline_since": None})
+        back_online(edge["org_id"], f"Η κάμερα «{cam['name']}» λειτουργεί ξανά")
+
+
+# ================================================================== data retention (GDPR): old images and clips are deleted
+def retention_days():
+    try:
+        return max(0, int(db.setting("retention_days", 30)))
+    except (TypeError, ValueError):
+        return 30
+
+
+def retention_run():
+    days = retention_days()
+    if not days:
+        return 0
+    cutoff = time.time() - days * 86400
+    n = 0
+    for name in os.listdir(db.MEDIA):
+        p = os.path.join(db.MEDIA, name)
+        try:
+            if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                os.remove(p)
+                n += 1
+        except OSError:
+            pass
+    db.ex("UPDATE events SET image=NULL WHERE ts<? AND image IS NOT NULL", (cutoff,))
+    db.ex("UPDATE events SET clip=NULL WHERE ts<? AND clip IS NOT NULL", (cutoff,))
+    if n:
+        logic.audit("σύστημα", "retention", f"διαγράφηκαν {n} αρχεία παλαιότερα των {days} ημερών")
+    return n
+
+
+# ================================================================== two-step login (TOTP, RFC 6238) and lockout
+import base64 as _b64  # noqa: E402
+import hmac as _hmac   # noqa: E402
+import secrets as _secrets  # noqa: E402
+
+LOCK_AFTER, LOCK_SECONDS = 5, 900      # 5 wrong passwords -> account locked for 15 minutes
+IP_LIMIT, IP_WINDOW = 20, 900          # 20 failures from one address in 15 minutes -> refused
+
+
+def totp_new():
+    return _b64.b32encode(_secrets.token_bytes(20)).decode().rstrip("=")
+
+
+def totp_code(secret, counter):
+    key = _b64.b32decode(secret + "=" * (-len(secret) % 8))
+    h = _hmac.new(key, counter.to_bytes(8, "big"), "sha1").digest()
+    o = h[-1] & 15
+    return str((int.from_bytes(h[o:o + 4], "big") & 0x7fffffff) % 1000000).zfill(6)
+
+
+def totp_ok(secret, code):
+    code = "".join(ch for ch in str(code or "") if ch.isdigit())
+    if not secret or len(code) != 6:
+        return False
+    t = int(time.time() // 30)
+    return any(_hmac.compare_digest(totp_code(secret, t + w), code) for w in (-1, 0, 1))
+
+
+def totp_uri(user, secret):
+    from urllib.parse import quote
+    return f"otpauth://totp/SKYWARDEN:{quote(user['username'])}?secret={secret}&issuer=SKYWARDEN&digits=6&period=30"
+
+
+def ip_blocked(ip):
+    r = db.q1("SELECT * FROM login_fail WHERE ip=?", (ip,))
+    return bool(r and r["n"] >= IP_LIMIT and r["first"] > time.time() - IP_WINDOW)
+
+
+def login_failed(ip, user=None):
+    now = time.time()
+    r = db.q1("SELECT * FROM login_fail WHERE ip=?", (ip,))
+    if not r or r["first"] < now - IP_WINDOW:
+        db.ex("INSERT INTO login_fail(ip,n,first) VALUES(?,1,?) ON CONFLICT(ip) DO UPDATE SET n=1, first=excluded.first", (ip, now))
+    else:
+        db.ex("UPDATE login_fail SET n=n+1 WHERE ip=?", (ip,))
+    if user:
+        n = (user.get("failed_logins") or 0) + 1
+        if n >= LOCK_AFTER:
+            db.update("users", user["id"], {"failed_logins": 0, "locked_until": now + LOCK_SECONDS})
+            logic.audit(user["name"], "login.locked", f"{LOCK_AFTER} λάθος προσπάθειες από {ip}")
+        else:
+            db.update("users", user["id"], {"failed_logins": n})
+
+
+def login_ok(user):
+    if user.get("failed_logins") or user.get("locked_until"):
+        db.update("users", user["id"], {"failed_logins": 0, "locked_until": None})
+
+
+# ================================================================== no-fly zones imported from a file (ED-269 / GeoJSON / KML, normalised in the browser)
+def import_zones(zones, source, replace):
+    if not isinstance(zones, list) or not zones:
+        raise ValueError("Δεν βρέθηκαν ζώνες στο αρχείο")
+    if len(zones) > 5000:
+        raise ValueError("Έως 5000 ζώνες ανά εισαγωγή")
+    source = (source or "εισαγωγή").strip()[:80]
+    rows = []
+    for z in zones:
+        name = str(z.get("name") or "Ζώνη").strip()[:120]
+        level = "block" if z.get("level") == "block" else "warn"
+        geom, lat, lon, radius = None, None, None, 0
+        if z.get("geom"):
+            polys = polygons_of(z["geom"])
+            pts = [pt for p in polys for ring in p for pt in ring]
+            if not pts or len(pts) > 20000 or not all(-180 <= pt[0] <= 180 and -90 <= pt[1] <= 90 for pt in pts):
+                continue
+            geom = json.dumps(z["geom"], separators=(",", ":"))
+            lon = sum(pt[0] for pt in pts) / len(pts)
+            lat = sum(pt[1] for pt in pts) / len(pts)
+            radius = max(logic.haversine_m(lat, lon, pt[1], pt[0]) for pt in pts)
+        elif z.get("lat") is not None and z.get("radius_m"):
+            lat, lon, radius = float(z["lat"]), float(z["lon"]), float(z["radius_m"])
+        else:
+            continue
+        rows.append({"name": name, "lat": lat, "lon": lon, "radius_m": round(radius), "level": level, "geom": geom,
+                     "notes": str(z.get("notes") or "")[:500], "source": source, "ext_id": str(z.get("ext_id") or "")[:80], "enabled": 1})
+    if not rows:
+        raise ValueError("Καμία έγκυρη ζώνη (χρειάζονται πολύγωνα ή κύκλοι με συντεταγμένες WGS84)")
+    if replace:
+        db.ex("DELETE FROM nofly WHERE source=?", (source,))
+    for r in rows:
+        db.insert("nofly", r)
+    return len(rows)

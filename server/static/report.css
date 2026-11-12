@@ -1,0 +1,40 @@
+/* SKYWARDEN · printable incident report (A4) */
+:root{--ink:#16202b;--mut:#5b6672;--line:#dde3e9;--soft:#f4f6f8;--red:#b42318;--amber:#b45309;--green:#15803d;--blue:#1d4ed8}
+*{box-sizing:border-box}
+body{margin:0;background:#e9edf1;color:var(--ink);font:13px/1.45 "Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif}
+main{max-width:900px;margin:18px auto 40px;background:#fff;padding:34px 40px;box-shadow:0 2px 12px rgba(0,0,0,.08)}
+.toolbar{max-width:900px;margin:14px auto 0;display:flex;justify-content:flex-end}
+.toolbar button{font:inherit;padding:8px 14px;border:1px solid #c5ced8;background:#fff;border-radius:7px;cursor:pointer}
+.muted{color:var(--mut)}
+.head{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;border-bottom:2px solid var(--ink);padding-bottom:12px;margin-bottom:18px}
+.brand{font-family:"Rajdhani",sans-serif;font-weight:700;font-size:22px;letter-spacing:.2em}
+.head .meta{text-align:right;font-size:12px;color:var(--mut)}
+h1{font-size:21px;margin:0 0 4px}
+h2{font-size:12.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--mut);margin:24px 0 8px;padding-bottom:4px;border-bottom:1px solid var(--line)}
+.status{display:inline-block;font-size:11.5px;font-weight:600;border:1px solid currentColor;border-radius:999px;padding:1px 9px;margin-left:6px;vertical-align:2px}
+.status.closed{color:var(--green)}.status.open{color:var(--red)}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:14px 0 4px}
+.kpi{background:var(--soft);border-radius:8px;padding:9px 11px}
+.kpi .l{font-size:11px;color:var(--mut)}.kpi .v{font-size:17px;font-weight:700;font-variant-numeric:tabular-nums}
+table{border-collapse:collapse;width:100%;font-size:12.5px}
+th,td{border-bottom:1px solid var(--line);padding:5px 7px;text-align:left;vertical-align:top}
+th{color:var(--mut);font-weight:600;background:var(--soft)}
+table.kv th{width:190px;background:none}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.t{white-space:nowrap;font-variant-numeric:tabular-nums}
+.ok{color:var(--green);font-weight:600}.no{color:var(--red);font-weight:600}.warn{color:var(--amber)}
+.imgs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.imgs figure{margin:0}.imgs img{width:100%;border-radius:6px;border:1px solid var(--line);display:block}
+.imgs figcaption{font-size:11px;color:var(--mut);margin-top:2px}
+.tl td:nth-child(2){width:140px;color:var(--mut)}
+.k-alarm{color:var(--red)}.k-escalate,.k-check,.k-postpone{color:var(--amber)}.k-drone{color:var(--blue)}
+.sign{display:grid;grid-template-columns:1fr 1fr;gap:40px;margin-top:40px}
+.sign div{border-top:1px solid var(--ink);padding-top:6px;font-size:12px;color:var(--mut)}
+.foot{margin-top:28px;font-size:11px;color:var(--mut);border-top:1px solid var(--line);padding-top:8px}
+@media (max-width:700px){main{padding:20px 16px;margin:0}.grid{grid-template-columns:repeat(2,1fr)}.imgs{grid-template-columns:repeat(2,1fr)}.head{flex-direction:column}.head .meta{text-align:left}}
+@media print{
+  @page{size:A4;margin:14mm 12mm}
+  body{background:#fff}main{box-shadow:none;margin:0;padding:0;max-width:none}.toolbar{display:none}
+  h2{break-after:avoid}table,figure,.kpi{break-inside:avoid}
+  a{color:inherit;text-decoration:none}
+}

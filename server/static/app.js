@@ -52,8 +52,15 @@ $('#soundBtn').textContent = 'Ήχος: κλειστός';
 function showLogin() { $('#app').hidden = true; $('#login').hidden = false; $('#lu').focus(); }
 $('#loginForm').onsubmit = async e => {
   e.preventDefault(); $('#lerr').textContent = '';
-  try { await api('/api/login', { username: $('#lu').value.trim(), password: $('#lp').value }); $('#lp').value = ''; boot(); }
-  catch (er) { $('#lerr').textContent = er.message; }
+  const body = { username: $('#lu').value.trim(), password: $('#lp').value };
+  if (!$('#l2').hidden) body.code = $('#lc').value.trim();
+  try {
+    const r = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), credentials: 'same-origin' });
+    const j = await r.json().catch(() => ({}));
+    if (j.need_2fa) { $('#l2').hidden = false; $('#lc').value = ''; $('#lc').focus(); if (body.code) $('#lerr').textContent = j.error; return; }
+    if (!r.ok) throw new Error(j.error || `Σφάλμα ${r.status}`);
+    $('#lp').value = ''; $('#lc').value = ''; $('#l2').hidden = true; boot();
+  } catch (er) { $('#lerr').textContent = er.message; }
 };
 $('#avatar').onclick = () => { $('#userMenu').hidden = !$('#userMenu').hidden; };
 document.addEventListener('click', e => { if (!$('#userBox').contains(e.target)) $('#userMenu').hidden = true; });
@@ -103,6 +110,11 @@ async function refresh() {
   S.seen = ids;
   if (fresh.length) {
     beep('alarm');
+    if (document.hidden && !S.titleTimer) { // flash the tab title until the operator comes back
+      const base = document.title; let k = 0;
+      S.titleTimer = setInterval(() => { document.title = ++k % 2 ? `🔴 Νέος συναγερμός · ${fresh[0].org_name}` : base; }, 1000);
+      document.addEventListener('visibilitychange', function back() { if (!document.hidden) { clearInterval(S.titleTimer); S.titleTimer = null; document.title = base; document.removeEventListener('visibilitychange', back); } });
+    }
     fresh.forEach(i => toast(`Νέος συναγερμός: ${i.org_name} · ${i.type_label} · ${i.camera_name || ''}`, 'alarm'));
     if (!S.sel) select(fresh[0].id);
   }
@@ -136,13 +148,15 @@ function connectStream() {
   es.onerror = () => { $('#stats').dataset.offline = '1'; };
   es.onopen = () => { delete $('#stats').dataset.offline; };
 }
-// Python server pushes changes live; on Cloudflare Pages the console polls (and pauses while the tab is hidden).
+// Python server pushes changes live; on Cloudflare Pages the console polls. In a background tab it keeps checking
+// every 10 s, so a new alarm still sounds (and the tab title flashes) while the operator works in another window.
 let tickN = 0;
 setInterval(() => {
   tickN++;
   $('#clock').textContent = new Date().toLocaleTimeString('el-GR', { hour12: false });
   $$('[data-age]').forEach(el => el.textContent = dur(Date.now() / 1000 - +el.dataset.age));
-  if ($('#app').hidden || !S.me || document.hidden) return;
+  if ($('#app').hidden || !S.me) return;
+  if (document.hidden) { if (S.cloud && tickN % 10 === 0) refresh(); return; }
   const flying = S.inc && S.inc.mission && S.inc.mission.phase !== 'landed';
   if (S.cloud) {
     if (tickN % 3 === 0) refresh();
@@ -448,7 +462,7 @@ function dispatchModal() {
   const best = opts.find(d => usable(d) && (!d.check || d.check.level !== 'block')) || opts.find(usable);
   const canOverride = ['admin', 'supervisor'].includes(S.me.role);
   modal(`<h2>Αποστολή drone</h2><p class="mut">${esc(i.org.name)} · ${esc(i.camera ? i.camera.name : '')}</p>
-    <div class="wx">${weatherLine(pf.weather)}</div>
+    <div class="wx">${weatherLine(pf.weather)}<div class="mut" style="margin-top:4px">Ζώνες: έλεγχος με όσες έχουν φορτωθεί στη Διαχείριση · <a href="https://dagr.hasp.gov.gr/" target="_blank" rel="noopener">επίσημος χάρτης ΥΠΑ</a></div></div>
     ${opts.map(d => { const ok = usable(d), c = d.check || { level: 'ok', issues: [] }; return `<label class="dockopt ${ok ? '' : 'dis'}"><input type="radio" name="dk" value="${d.id}" ${d === best ? 'checked' : ''} ${ok ? '' : 'disabled'}>
       <span><b>${esc(d.name)}</b><div class="mut">${km(d.distance_m)} · άφιξη ~${dur(d.eta_s)} · ${d.adapter === 'sim' ? 'προσομοίωση' : 'DJI Dock'}</div>
         ${ok && c.issues.length ? `<ul class="issues">${c.issues.map(x => `<li class="${x.level}">${esc(x.text)}</li>`).join('')}</ul>` : ''}</span>
@@ -561,8 +575,17 @@ function renderMap() {
     L.marker([o.lat, o.lon], { icon: icon(cls), zIndexOffset: alarmOrgs.has(o.id) ? 500 : 0 }).bindPopup(`<b>${esc(o.name)}</b><br>${esc(o.address)}<br>${o.armed ? 'Οπλισμένη' : 'Αφόπλιστη'} · ${o.cams_online}/${o.cams_total} κάμερες`).addTo(S.layers.base);
     pts.push([o.lat, o.lon]);
   });
-  (S.ov.nofly || []).forEach(z => L.circle([z.lat, z.lon], { radius: z.radius_m, color: z.level === 'block' ? '#ef4444' : '#f59e0b', weight: 1, dashArray: '4 5', opacity: .55, fillOpacity: .06 })
-    .bindTooltip(`${esc(z.name)} · ${z.level === 'block' ? 'απαγόρευση' : 'προσοχή'}`).addTo(S.layers.base));
+  // no-fly zones: loaded once and again only when they change (official zone files can be large polygons)
+  if (S.ov.nofly_ver !== undefined && S.noflyVer !== S.ov.nofly_ver) {
+    S.noflyVer = S.ov.nofly_ver;
+    api('/api/nofly').then(z => { S.nofly = z; renderMap(); }).catch(() => { S.noflyVer = null; });
+  }
+  (S.nofly || []).forEach(z => {
+    const st = { color: z.level === 'block' ? '#ef4444' : '#f59e0b', weight: 1, dashArray: '4 5', opacity: .55, fillOpacity: .06 };
+    let g = null; try { g = z.geom ? JSON.parse(z.geom) : null; } catch { }
+    const shape = g ? L.geoJSON(g, { style: () => st, interactive: true }) : L.circle([z.lat, z.lon], { radius: z.radius_m, ...st });
+    shape.bindTooltip(`${esc(z.name)} · ${z.level === 'block' ? 'απαγόρευση' : 'προσοχή'}`).addTo(S.layers.base);
+  });
   S.ov.docks.forEach(d => {
     L.circle([d.lat, d.lon], { radius: d.radius_km * 1000, color: '#60a5fa', weight: 1, opacity: .35, fillOpacity: .04 }).addTo(S.layers.base);
     L.marker([d.lat, d.lon], { icon: icon('mk-dock' + (d.busy ? ' busy' : ''), 16) }).bindPopup(`<b>${esc(d.name)}</b><br>${d.busy ? 'σε αποστολή' : 'διαθέσιμο'}`).addTo(S.layers.base);

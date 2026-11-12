@@ -370,3 +370,7 @@ body.customer .stats,body.customer #soundBtn,body.customer .clock{display:none}
   .contact{flex-wrap:wrap}
   .contact .n{flex-basis:100%}
 }
+#l2{display:flex;flex-direction:column;gap:6px}
+.tfa-steps{margin:10px 0 6px;padding-left:20px}
+.tfa-qr{display:flex;justify-content:center;background:#fff;border-radius:10px;padding:12px;width:fit-content;margin:6px auto}
+.modal .small{font-size:12px}

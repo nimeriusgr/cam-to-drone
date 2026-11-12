@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS cam_commands(
   id INTEGER PRIMARY KEY, camera_id INTEGER NOT NULL, edge_id INTEGER NOT NULL, cmd TEXT NOT NULL, args TEXT DEFAULT '{}',
   status TEXT NOT NULL DEFAULT 'pending', result TEXT, who TEXT, created REAL NOT NULL, sent_ts REAL, done_ts REAL);
 CREATE INDEX IF NOT EXISTS ix_cmd_edge ON cam_commands(edge_id, status);
+CREATE TABLE IF NOT EXISTS login_fail(ip TEXT PRIMARY KEY, n INTEGER NOT NULL, first REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS ix_inc_status ON incidents(status, last_ts);
 CREATE INDEX IF NOT EXISTS ix_inc_first ON incidents(first_ts);
 CREATE INDEX IF NOT EXISTS ix_ev_ts ON events(ts);
@@ -80,7 +81,11 @@ CREATE INDEX IF NOT EXISTS ix_shift_open ON shifts(end_ts);
 
 # columns added after v1.0 (existing databases get them with ALTER TABLE)
 COLUMNS = [("missions", "onsite_ts", "REAL"), ("events", "clip", "TEXT"), ("edges", "update_requested", "INTEGER DEFAULT 0"),
-           ("cameras", "arming_mode", "TEXT DEFAULT 'inherit'"), ("cameras", "caps", "TEXT")]
+           ("cameras", "arming_mode", "TEXT DEFAULT 'inherit'"), ("cameras", "caps", "TEXT"),
+           ("edges", "offline_since", "REAL"), ("cameras", "offline_since", "REAL"),
+           ("users", "totp_secret", "TEXT"), ("users", "totp_on", "INTEGER DEFAULT 0"),
+           ("users", "failed_logins", "INTEGER DEFAULT 0"), ("users", "locked_until", "REAL"),
+           ("nofly", "geom", "TEXT"), ("nofly", "source", "TEXT DEFAULT ''"), ("nofly", "ext_id", "TEXT")]
 
 JSON_COLS = {"schedule", "allowed_types", "sop", "cameras", "sop_done", "speaker_presets", "args"}
 
