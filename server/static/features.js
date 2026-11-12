@@ -345,8 +345,8 @@
     cp.el.innerHTML = `
       <div class="cp-h"><div><b>${esc(d.name)}</b><div class="mut">${esc(d.org_name)}${caps.info ? ` · ${esc(caps.info.manufacturer)} ${esc(caps.info.model)}` : ''}</div></div>
         <button type="button" class="btn sm ghost" id="cpX" aria-label="Κλείσιμο">✕</button></div>
-      <div class="cp-s"><h4>Οπλισμός <span class="pill ${d.armed_now ? 'ack' : ''}">${d.armed_now ? 'οπλισμένη τώρα' : 'αφόπλιστη τώρα'}</span></h4>
-        ${seg('arm', [['inherit', `Όπως η επιχείρηση <small>(${d.org_armed ? 'οπλισμένη' : 'αφόπλιστη'})</small>`], ['armed', 'Οπλισμένη'], ['disarmed', 'Αφοπλισμένη']], d.arming_mode)}
+      <div class="cp-s"><h4>Οπλισμός <span class="pill ${d.armed_now ? 'ack' : ''}" title="Αν η κάμερα δημιουργεί συναγερμό αυτή τη στιγμή">Τώρα: ${d.armed_now ? 'Οπλισμένη' : 'Αφοπλισμένη'}</span></h4>
+        ${seg('arm', [['inherit', `Όπως η επιχείρηση <small>(τώρα ${d.org_armed ? 'οπλισμένη' : 'αφοπλισμένη'})</small>`], ['armed', 'Οπλισμένη'], ['disarmed', 'Αφοπλισμένη']], d.arming_mode)}
         <p class="mut small">Αφοπλισμένη: τα σήματα της κάμερας καταγράφονται αλλά δεν δημιουργούν συναγερμό. Οπλισμένη: δημιουργεί συναγερμό ακόμα κι εκτός ωραρίου της επιχείρησης.</p></div>
       ${ctl}${noCaps}
       ${caps.ptz ? `<div class="cp-s"><h4>Κίνηση (PTZ)</h4><div class="ptz">
