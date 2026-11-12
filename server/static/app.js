@@ -327,7 +327,7 @@ function sideHtml(i, m, flying, closed, cust) {
       <button class="btn" data-a="snooze">Παύση κάμερας</button>
       ${!flying ? '<button class="btn" data-a="close">Κλείσιμο</button>' : ''}
     </div></div>`;
-  const sop = (org.sop || []).length ? `<div class="sec sop"><h3>Σχέδιο ενεργειών <span class="r mut">${sopDone.size}/${org.sop.length}</span></h3>
+  const sop = (org.sop || []).length ? `<div class="sec sop"><h3>Πρωτόκολλο ενεργειών <span class="r mut">${sopDone.size}/${org.sop.length}</span></h3>
       ${org.sop.map((s, k) => `<label class="${sopDone.has(k) ? 'done' : ''}"><input type="checkbox" data-sop="${k}" ${sopDone.has(k) ? 'checked' : ''} ${closed ? 'disabled' : ''}><span>${esc(s)}</span></label>`).join('')}</div>` : '';
   const speaker = flying && m.dock.has_speaker ? `<div class="sec"><h3>Μεγάφωνο drone</h3>
       <div class="presets">${(org.speaker_presets || []).map((p, k) => `<button class="btn sm" data-preset="${k}">${esc(p)}</button>`).join('')}</div>
