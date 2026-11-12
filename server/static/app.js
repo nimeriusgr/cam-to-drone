@@ -522,10 +522,13 @@ function copy(text) {
 }
 
 /* ------------------------------------------------------------ modal */
+let modalSeq = 0;
 function modal(html, okLabel, onOk, okDisabled) {
+  const me = ++modalSeq;
   $('#modal').innerHTML = `<div class="modal-bg"><div class="modal" role="dialog" aria-modal="true">${html}<div class="err" id="mErr"></div>
     <div class="mb"><button class="btn" id="mCancel">Ακύρωση</button><button class="btn pri" id="mOk" ${okDisabled ? 'disabled' : ''}>${okLabel}</button></div></div></div>`;
-  const close = () => { $('#modal').innerHTML = ''; };
+  // close only this window: if onOk opened another one (e.g. the new box token), that one stays open
+  const close = () => { if (modalSeq === me) $('#modal').innerHTML = ''; };
   $('#mCancel').onclick = close;
   $('.modal-bg').onmousedown = e => { if (e.target.classList.contains('modal-bg')) close(); };
   $('#mOk').onclick = async () => {
