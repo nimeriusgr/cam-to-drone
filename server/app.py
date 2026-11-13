@@ -11,6 +11,7 @@ import os
 import random
 import re
 import secrets
+import sqlite3
 import sys
 import threading
 import time
@@ -42,6 +43,25 @@ ADMIN = {
     "nofly": ["name", "lat", "lon", "radius_m", "level", "notes", "enabled"],
 }
 ROLES = {"admin", "supervisor", "operator", "customer"}
+
+
+
+UNIQUE_MSG = {
+    "users.username": "Το όνομα χρήστη χρησιμοποιείται ήδη από άλλον χρήστη. Διαλέξτε διαφορετικό όνομα χρήστη.",
+    "users.api_token": "Το API token συμπίπτει με άλλου χρήστη. Δοκιμάστε ξανά.",
+    "cameras.org_id": "Υπάρχει ήδη κάμερα με αυτό το αναγνωριστικό στην ίδια επιχείρηση.",
+    "boxes.token": "Το token του κουτιού συμπίπτει με άλλο. Δοκιμάστε ξανά.",
+    "orgs.webhook_token": "Το webhook token συμπίπτει με άλλης επιχείρησης. Δοκιμάστε ξανά.",
+}
+
+
+def unique_message(msg):
+    """Turn a database integrity error into a message people understand."""
+    import re
+    m = re.search(r"UNIQUE constraint failed: ([\w.]+)", msg)
+    if m:
+        return UNIQUE_MSG.get(m.group(1), "Η τιμή που δώσατε υπάρχει ήδη σε άλλη εγγραφή. Αλλάξτε την και δοκιμάστε ξανά.")
+    return "Τα στοιχεία δεν είναι έγκυρα (σύγκρουση με άλλη εγγραφή)."
 
 
 class ApiError(Exception):
@@ -327,6 +347,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send(e.code, {"ok": False, "error": e.msg})
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except sqlite3.IntegrityError as e:
+            self.send(409, {"ok": False, "error": unique_message(str(e))})
         except Exception as e:  # noqa: BLE001
             import traceback
             traceback.print_exc()

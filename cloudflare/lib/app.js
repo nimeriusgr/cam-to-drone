@@ -1314,11 +1314,27 @@ export async function scheduled(env, ctx) {
   if (now() - (last || 0) > 3600) { await app.db.setSetting('retention_last', now()); await app.retentionRun(); }
 }
 
+// Turn a database "UNIQUE constraint failed" error into a message people understand.
+const UNIQUE_MSG = {
+  'users.username': 'Το όνομα χρήστη χρησιμοποιείται ήδη από άλλον χρήστη. Διαλέξτε διαφορετικό όνομα χρήστη.',
+  'users.api_token': 'Το API token συμπίπτει με άλλου χρήστη. Δοκιμάστε ξανά.',
+  'cameras.org_id': 'Υπάρχει ήδη κάμερα με αυτό το αναγνωριστικό στην ίδια επιχείρηση.',
+  'boxes.token': 'Το token του κουτιού συμπίπτει με άλλο. Δοκιμάστε ξανά.',
+  'orgs.webhook_token': 'Το webhook token συμπίπτει με άλλης επιχείρησης. Δοκιμάστε ξανά.',
+};
+export function uniqueMessage(msg) {
+  const m = /UNIQUE constraint failed: ([\w.]+)/.exec(msg);
+  if (!m) return null;
+  return UNIQUE_MSG[m[1]] || 'Η τιμή που δώσατε υπάρχει ήδη σε άλλη εγγραφή. Αλλάξτε την και δοκιμάστε ξανά.';
+}
+
 export async function handle(context) {
   const app = new App(context.env, context.request, context);
   try { return await app.handle(); }
   catch (e) {
     if (e instanceof ApiError) return json({ ok: false, error: e.message }, e.code);
+    const dup = uniqueMessage(String(e && e.message || ''));
+    if (dup) return json({ ok: false, error: dup }, 409);
     console.error(e);
     return json({ ok: false, error: `Σφάλμα server: ${e.message}` }, 500);
   }
