@@ -248,7 +248,6 @@ input,select{background:#0b1219;color:var(--tx);border:1px solid var(--line);bor
 <section class="card"><h3>ΣΤΟΙΧΕΙΑ ΚΑΜΕΡΑΣ</h3>
 <form id="camf" class="grid">
 <label>Μάρκα<select name="brand"><option>Hikvision</option><option>Dahua</option><option>Άλλη</option></select></label>
-<label>Χώρος / περιγραφή<input name="site" placeholder="π.χ. Αποθήκη, πύλη φόρτωσης"></label>
 <label>Εξωτερική IP ή DDNS<input name="host" placeholder="π.χ. 85.72.10.4 ή adesco.ddns.net"></label>
 <label>Θύρα HTTP<input name="http_port" inputmode="numeric" placeholder="80"></label>
 <label>Θύρα RTSP<input name="rtsp_port" inputmode="numeric" placeholder="554"></label>
@@ -298,7 +297,7 @@ for(const i of [$('sfrom'),$('sto')]){i.onfocus=()=>editing=true;i.onblur=()=>ed
 poll();
 const F=$('camf');
 async function loadCam(){const c=await (await fetch('/api/'+T+'/camera',{cache:'no-store'})).json();
- for(const k of ['brand','site','host','http_port','rtsp_port','channel','username'])if(F[k])F[k].value=c[k]||(k==='brand'?'Hikvision':'');
+ for(const k of ['brand','host','http_port','rtsp_port','channel','username'])if(F[k])F[k].value=c[k]||(k==='brand'?'Hikvision':'');
  F.password.value='';F.password.placeholder=c.has_password?'αποθηκευμένος (αφήστε κενό)':'';
  $('camst').textContent=c.updated?'Αποθηκεύτηκε '+fmt(c.updated):'';}
 F.onsubmit=async e=>{e.preventDefault();const b=Object.fromEntries(new FormData(F));
