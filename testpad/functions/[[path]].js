@@ -257,17 +257,13 @@ input,select{background:#0b1219;color:var(--tx);border:1px solid var(--line);bor
 <label>Κωδικός<input name="password" type="password" autocomplete="new-password" placeholder=""></label>
 <div class="wide row"><button type="submit">Αποθήκευση</button><button type="button" class="ghost" id="snap">Δοκιμή σύνδεσης (λήψη εικόνας)</button><span id="camst" class="hint"></span></div>
 </form><div id="snapout"></div></section>
-<details><summary>Ρύθμιση κάμερας</summary>
-<p>Διεύθυνση που δέχεται τα σήματα: <code id="hookurl"></code></p>
-<p><b>Hikvision:</b> Configuration → Network → Advanced → HTTP Listening (ή Alarm Server): Destination <code id="host"></code>, URL <code>/hook/${T}</code>, θύρα 443, πρωτόκολλο HTTPS. Μετά, στο συμβάν (Motion, Line Crossing, Intrusion) → Linkage Method → <b>Notify Surveillance Center</b>.</p>
-<p><b>Dahua:</b> Setting → Network → Alarm Center (HTTP) ή Event → Linkage → HTTP, με την ίδια διεύθυνση.</p>
-</details>
+<section class="card"><label>Διεύθυνση σήματος κάμερας<div class="row"><input id="hookurl" readonly onclick="this.select()" style="flex:1;min-width:0"><button type="button" class="ghost" id="copyhook">Αντιγραφή</button></div></label></section>
 </main>
 <script>
 const T=${JSON.stringify(T)};let after=0,all=[],first=true,audio=null;
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmt=t=>new Date(t).toLocaleString('el-GR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
-$('hookurl').textContent=location.origin+'/hook/'+T;$('host').textContent=location.host;
+$('hookurl').value=location.origin+'/hook/'+T;$('copyhook').onclick=async()=>{try{await navigator.clipboard.writeText($('hookurl').value);$('copyhook').textContent='Αντιγράφηκε ✓'}catch{$('hookurl').select()}};
 $('enable').onclick=async()=>{audio=audio||new (window.AudioContext||window.webkitAudioContext)();await audio.resume();
  if('Notification'in window&&Notification.permission==='default')try{await Notification.requestPermission()}catch{}
  $('enable').textContent='Ήχος ενεργός ✓';$('enable').className='ghost';};
