@@ -225,7 +225,7 @@ pre{background:#0b1219;border:1px solid var(--line);padding:10px;border-radius:8
 .arm .big{font-size:20px;font-weight:800;letter-spacing:.06em}.arm.on .big{color:var(--red)}.arm.off .big{color:var(--ok)}
 .arm .who{color:var(--mut);font-size:13px}.seg{display:flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-left:auto}
 .seg button{background:transparent;color:var(--tx);border-radius:0;border-right:1px solid var(--line);padding:10px 16px}.seg button:last-child{border-right:0}
-.seg button.sel{background:var(--acc);color:#04121c}.sched{display:flex;gap:8px;align-items:center;color:var(--mut);font-size:13px}.sched input{width:110px;padding:7px 8px}
+.seg button.sel{background:var(--acc);color:#04121c}.sched{display:flex;gap:8px;align-items:center;color:var(--mut);font-size:13px}.sched select{width:auto;min-width:96px;padding:7px 10px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
 .hint{color:var(--mut);font-size:13px;margin:0 0 12px}
 .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.wide{grid-column:1/-1}
@@ -241,7 +241,7 @@ input,select{background:#0b1219;color:var(--tx);border:1px solid var(--line);bor
 <button id="enable">Ενεργοποίηση ήχου &amp; ειδοποιήσεων</button></header>
 <main>
 <section class="arm" id="arm"><div class="st"><div class="ic" id="armic">●</div><div><div class="big" id="armtxt">…</div><div class="who" id="armwho"></div></div></div>
-<div class="sched" id="sched" hidden>Οπλισμένο από <input type="time" id="sfrom" value="20:00"> έως <input type="time" id="sto" value="07:00"></div>
+<div class="sched" id="sched" hidden>Οπλισμένο από <select id="sfrom"></select> έως <select id="sto"></select></div>
 <div class="seg"><button data-m="armed">Όπλιση</button><button data-m="disarmed">Αφόπλιση</button><button data-m="schedule">Ωράριο</button></div></section>
 <section class="alarm" id="alarm"><div class="waiting"><b>Σε αναμονή συναγερμού</b>Μόλις η κάμερα στείλει σήμα, εμφανίζεται εδώ με ήχο.</div></section>
 <section><h3>ΙΣΤΟΡΙΚΟ ΣΗΜΑΤΩΝ</h3><table><thead><tr><th>Ώρα</th><th>Συμβάν</th><th class="hide-m">Κανάλι</th><th class="hide-m">IP</th><th>Κατάσταση</th></tr></thead><tbody id="rows"><tr><td colspan="5" style="color:var(--mut)">Κανένα σήμα ακόμα.</td></tr></tbody></table></section>
@@ -268,7 +268,7 @@ input,select{background:#0b1219;color:var(--tx);border:1px solid var(--line);bor
 <script>
 const T=${JSON.stringify(T)};let after=0,all=[],first=true,audio=null;
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const fmt=t=>new Date(t).toLocaleString('el-GR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+const fmt=t=>new Date(t).toLocaleString('el-GR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
 $('hookurl').textContent=location.origin+'/hook/'+T;$('host').textContent=location.host;
 $('enable').onclick=async()=>{audio=audio||new (window.AudioContext||window.webkitAudioContext)();await audio.resume();
  if('Notification'in window&&Notification.permission==='default')try{await Notification.requestPermission()}catch{}
@@ -291,16 +291,17 @@ async function poll(){try{const r=await fetch('/api/'+T+'/events?after='+after,{
   else if(first){const l=all.find(e=>e.state==='active');if(l)show(l,false);}}
  if(d.arm)armUI(d.arm);
  first=false;}catch{}setTimeout(poll,2000);}
+for(const id of ['sfrom','sto']){const sel=$(id);for(let m=0;m<1440;m+=30){const v=String(m/60|0).padStart(2,'0')+':'+String(m%60).padStart(2,'0');sel.add(new Option(v,v))}}
 const MODES={armed:'ΟΠΛΙΣΜΕΝΟ',disarmed:'ΑΦΟΠΛΙΣΜΕΝΟ'};let editing=false;
 function armUI(a){$('arm').className='arm '+(a.armed?'on':'off');$('armic').textContent=a.armed?'⛨':'○';
  $('armtxt').textContent=MODES[a.armed?'armed':'disarmed']+(a.mode==='schedule'?' · ΩΡΑΡΙΟ':'');
  $('armwho').textContent=(a.mode==='schedule'?'Οπλισμένο '+a.from+'–'+a.to+'. ':'')+(a.changed?'Αλλαγή'+(a.by?' από '+a.by:'')+', '+fmt(a.changed):'');
  for(const b of document.querySelectorAll('.seg button'))b.className=b.dataset.m===a.mode?'sel':'';
- $('sched').hidden=a.mode!=='schedule';if(!editing){$('sfrom').value=a.from;$('sto').value=a.to;}}
+ $('sched').hidden=a.mode!=='schedule';if(!editing){for(const [id,v] of [['sfrom',a.from],['sto',a.to]]){const sel=$(id);if(![...sel.options].some(o=>o.value===v))sel.add(new Option(v,v));sel.value=v;}}}
 function who(){let n='';try{n=localStorage.getItem('skw_name')||''}catch{}if(!n){n=(prompt('Το όνομά σας (για το ιστορικό αλλαγών):')||'').trim();try{if(n)localStorage.setItem('skw_name',n)}catch{}}return n;}
 async function setArm(mode){const r=await fetch('/api/'+T+'/arm',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode,from:$('sfrom').value,to:$('sto').value,by:who()})});if(r.ok)armUI(await r.json());}
 for(const b of document.querySelectorAll('.seg button'))b.onclick=()=>setArm(b.dataset.m);
-for(const i of [$('sfrom'),$('sto')]){i.onfocus=()=>editing=true;i.onchange=()=>{editing=false;setArm('schedule')};}
+for(const i of [$('sfrom'),$('sto')]){i.onfocus=()=>editing=true;i.onblur=()=>editing=false;i.onchange=()=>{editing=false;setArm('schedule')};}
 poll();
 const F=$('camf');
 async function loadCam(){const c=await (await fetch('/api/'+T+'/camera',{cache:'no-store'})).json();
