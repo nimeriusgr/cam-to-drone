@@ -24,8 +24,6 @@ export async function onRequest({ request, env }) {
     if (p === `/${T}` || p === `/${T}/`) return new Response(page(T), { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
     if (p === `/api/${T}/events`) return await events(env, +url.searchParams.get('after') || 0);
     if (p === `/api/${T}/arm` && request.method === 'POST') return await setArm(request, env);
-    if (p === `/api/${T}/camera`) return request.method === 'POST' ? await saveCam(request, env) : await getCam(env);
-    if (p === `/api/${T}/camera/snapshot` && request.method === 'POST') return await snapshot(env);
     const im = p.match(new RegExp(`^/api/${T}/img/(\\d+)$`));
     if (im) return await image(env, +im[1]);
   } catch (e) {
@@ -60,59 +58,6 @@ async function setArm(request, env) {
   await env.DB.prepare('INSERT OR REPLACE INTO arm (id,mode,sfrom,sto,by,ts) VALUES (1,?,?,?,?,?)')
     .bind(mode, hm(b.from) || cur.from, hm(b.to) || cur.to, String(b.by || '').trim().slice(0, 60), Date.now()).run();
   return Response.json(await armState(env.DB));
-}
-
-// ------------------------------------------------------------------ camera details
-const CAM_FIELDS = ['brand', 'site', 'host', 'http_port', 'rtsp_port', 'username', 'channel', 'notes'];
-async function camRow(db) {
-  await db.exec('CREATE TABLE IF NOT EXISTS cam (id INTEGER PRIMARY KEY, brand TEXT, site TEXT, host TEXT, http_port TEXT, rtsp_port TEXT, username TEXT, password TEXT, channel TEXT, notes TEXT, updated INTEGER)');
-  return await db.prepare('SELECT * FROM cam WHERE id=1').first() || {};
-}
-async function getCam(env) {
-  const r = await camRow(env.DB), o = {};
-  for (const f of CAM_FIELDS) o[f] = r[f] || '';
-  o.has_password = !!r.password; o.updated = r.updated || null;
-  return Response.json(o, { headers: { 'cache-control': 'no-store' } });
-}
-async function saveCam(request, env) {
-  const old = await camRow(env.DB), b = await request.json();
-  const v = f => String(b[f] ?? '').trim().slice(0, 300);
-  const pw = b.password ? String(b.password).slice(0, 200) : (b.clear_password ? null : old.password || null);
-  await env.DB.prepare(`INSERT OR REPLACE INTO cam (id,${CAM_FIELDS.join(',')},password,updated) VALUES (1,${CAM_FIELDS.map(() => '?').join(',')},?,?)`)
-    .bind(...CAM_FIELDS.map(v), pw, Date.now()).run();
-  return getCam(env);
-}
-
-// Pull one snapshot from the camera (Hikvision ISAPI / Dahua CGI) with Basic or Digest auth.
-async function snapshot(env) {
-  const c = await camRow(env.DB);
-  if (!c.host) return Response.json({ error: 'Συμπληρώστε πρώτα τη διεύθυνση της κάμερας.' }, { status: 400 });
-  const ch = (c.channel || '1').replace(/\D/g, '') || '1';
-  const port = c.http_port ? ':' + c.http_port.replace(/\D/g, '') : '';
-  const host = c.host.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-  const scheme = /^https:/.test(c.host) || c.http_port === '443' ? 'https' : 'http';
-  const path = /dahua/i.test(c.brand) ? `/cgi-bin/snapshot.cgi?channel=${ch}` : `/ISAPI/Streaming/channels/${ch}01/picture`;
-  const url = `${scheme}://${host}${port}${path}`;
-  try {
-    let r = await fetch(url, { headers: c.username ? { authorization: 'Basic ' + btoa(`${c.username}:${c.password || ''}`) } : {}, signal: AbortSignal.timeout(12000) });
-    const ch401 = r.status === 401 && r.headers.get('www-authenticate');
-    if (ch401 && /digest/i.test(ch401)) r = await fetch(url, { headers: { authorization: await digest(ch401, 'GET', path, c.username || '', c.password || '') }, signal: AbortSignal.timeout(12000) });
-    const ct = r.headers.get('content-type') || '';
-    if (r.ok && ct.startsWith('image/')) return new Response(r.body, { headers: { 'content-type': ct, 'cache-control': 'no-store' } });
-    const msg = r.status === 401 ? 'Η κάμερα απάντησε, αλλά δεν δέχτηκε όνομα χρήστη / κωδικό.' : `Η κάμερα απάντησε με κωδικό ${r.status}.`;
-    return Response.json({ error: msg, url: url.replace(/\/\/[^/]*@/, '//') }, { status: 502 });
-  } catch (e) {
-    return Response.json({ error: 'Δεν έγινε σύνδεση με την κάμερα: ' + (e.message || e) + '. Ελέγξτε IP / θύρα και ότι η θύρα είναι ανοιχτή στο router.', url }, { status: 502 });
-  }
-}
-async function md5(s) { return [...new Uint8Array(await crypto.subtle.digest('MD5', new TextEncoder().encode(s)))].map(b => b.toString(16).padStart(2, '0')).join(''); }
-async function digest(header, method, uri, user, pass) {
-  const p = {}; for (const m of header.matchAll(/(\w+)="?([^",]*)"?/g)) p[m[1]] = m[2];
-  const nc = '00000001', cnonce = crypto.randomUUID().replace(/-/g, '').slice(0, 16), qop = (p.qop || '').split(',')[0].trim();
-  const ha1 = await md5(`${user}:${p.realm}:${pass}`), ha2 = await md5(`${method}:${uri}`);
-  const resp = qop ? await md5(`${ha1}:${p.nonce}:${nc}:${cnonce}:${qop}:${ha2}`) : await md5(`${ha1}:${p.nonce}:${ha2}`);
-  return `Digest username="${user}", realm="${p.realm}", nonce="${p.nonce}", uri="${uri}", response="${resp}"` +
-    (qop ? `, qop=${qop}, nc=${nc}, cnonce="${cnonce}"` : '') + (p.opaque ? `, opaque="${p.opaque}"` : '');
 }
 
 async function hook(request, env) {
@@ -225,14 +170,13 @@ pre{background:#0b1219;border:1px solid var(--line);padding:10px;border-radius:8
 .arm .big{font-size:20px;font-weight:800;letter-spacing:.06em}.arm.on .big{color:var(--red)}.arm.off .big{color:var(--ok)}
 .arm .who{color:var(--mut);font-size:13px}.seg{display:flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-left:auto}
 .seg button{background:transparent;color:var(--tx);border-radius:0;border-right:1px solid var(--line);padding:10px 16px}.seg button:last-child{border-right:0}
-.seg button.sel{background:var(--acc);color:#04121c}.sched{display:flex;gap:8px;align-items:center;color:var(--mut);font-size:13px}.sched select{width:auto;min-width:96px;padding:7px 10px}
+.seg button.sel{background:var(--acc);color:#04121c}.sched{display:flex;gap:8px;align-items:center;color:var(--mut);font-size:13px}.sched[hidden]{display:none}.sched select{width:auto;min-width:96px;padding:7px 10px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
 .hint{color:var(--mut);font-size:13px;margin:0 0 12px}
 .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.wide{grid-column:1/-1}
 label{display:grid;gap:5px;font-size:13px;color:var(--mut)}
 input,select{background:#0b1219;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:9px 10px;font:inherit;font-size:16px;width:100%}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.row .hint{margin:0}
-#snapout img{max-width:100%;border-radius:8px;margin-top:12px;border:1px solid var(--line)}#snapout .err{color:#fca5a5;margin-top:12px}
 @media(max-width:760px){.alarm .body{grid-template-columns:1fr}.hide-m{display:none}.grid{grid-template-columns:1fr 1fr}
  main{padding:16px}header{padding:12px 16px}.pill{margin-left:0}.arm .st{min-width:0}.seg{margin-left:0;width:100%}.seg button{flex:1;padding:10px 6px}.sched{flex-wrap:wrap}}
 </style></head><body>
@@ -240,22 +184,11 @@ input,select{background:#0b1219;color:var(--tx);border:1px solid var(--line);bor
 <div class="pill"><span class="dot" id="dot"></span><span id="contact">Αναμονή πρώτου σήματος από την κάμερα</span></div>
 <button id="enable">Ενεργοποίηση ήχου &amp; ειδοποιήσεων</button></header>
 <main>
-<section class="arm" id="arm"><div class="st"><div class="ic" id="armic">●</div><div><div class="big" id="armtxt">…</div><div class="who" id="armwho"></div></div></div>
+<section class="arm" id="arm"><div class="st"><div class="ic" id="armic">●</div><div><div class="big" id="armtxt">&nbsp;</div><div class="who" id="armwho"></div></div></div>
 <div class="sched" id="sched" hidden>Οπλισμένο από <select id="sfrom"></select> έως <select id="sto"></select></div>
 <div class="seg"><button data-m="armed">Όπλιση</button><button data-m="disarmed">Αφόπλιση</button><button data-m="schedule">Ωράριο</button></div></section>
 <section class="alarm" id="alarm"><div class="waiting"><b>Σε αναμονή συναγερμού</b>Μόλις η κάμερα στείλει σήμα, εμφανίζεται εδώ με ήχο.</div></section>
 <section><h3>ΙΣΤΟΡΙΚΟ ΣΗΜΑΤΩΝ</h3><table><thead><tr><th>Ώρα</th><th>Συμβάν</th><th class="hide-m">Κανάλι</th><th class="hide-m">IP</th><th>Κατάσταση</th></tr></thead><tbody id="rows"><tr><td colspan="5" style="color:var(--mut)">Κανένα σήμα ακόμα.</td></tr></tbody></table></section>
-<section class="card"><h3>ΣΤΟΙΧΕΙΑ ΚΑΜΕΡΑΣ</h3>
-<form id="camf" class="grid">
-<label>Μάρκα<select name="brand"><option>Hikvision</option><option>Dahua</option><option>Άλλη</option></select></label>
-<label>Εξωτερική IP ή DDNS<input name="host" placeholder="π.χ. 85.72.10.4 ή adesco.ddns.net"></label>
-<label>Θύρα HTTP<input name="http_port" inputmode="numeric" placeholder="80"></label>
-<label>Θύρα RTSP<input name="rtsp_port" inputmode="numeric" placeholder="554"></label>
-<label>Κανάλι<input name="channel" inputmode="numeric" placeholder="1"></label>
-<label>Όνομα χρήστη<input name="username" autocomplete="off"></label>
-<label>Κωδικός<input name="password" type="password" autocomplete="new-password" placeholder=""></label>
-<div class="wide row"><button type="submit">Αποθήκευση</button><button type="button" class="ghost" id="snap">Δοκιμή σύνδεσης (λήψη εικόνας)</button><span id="camst" class="hint"></span></div>
-</form><div id="snapout"></div></section>
 <section class="card"><label>Διεύθυνση σήματος κάμερας<div class="row"><input id="hookurl" readonly onclick="this.select()" style="flex:1;min-width:0"><button type="button" class="ghost" id="copyhook">Αντιγραφή</button></div></label></section>
 </main>
 <script>
@@ -295,18 +228,5 @@ async function setArm(mode){const r=await fetch('/api/'+T+'/arm',{method:'POST',
 for(const b of document.querySelectorAll('.seg button'))b.onclick=()=>setArm(b.dataset.m);
 for(const i of [$('sfrom'),$('sto')]){i.onfocus=()=>editing=true;i.onblur=()=>editing=false;i.onchange=()=>{editing=false;setArm('schedule')};}
 poll();
-const F=$('camf');
-async function loadCam(){const c=await (await fetch('/api/'+T+'/camera',{cache:'no-store'})).json();
- for(const k of ['brand','host','http_port','rtsp_port','channel','username'])if(F[k])F[k].value=c[k]||(k==='brand'?'Hikvision':'');
- F.password.value='';F.password.placeholder=c.has_password?'αποθηκευμένος (αφήστε κενό)':'';
- $('camst').textContent=c.updated?'Αποθηκεύτηκε '+fmt(c.updated):'';}
-F.onsubmit=async e=>{e.preventDefault();const b=Object.fromEntries(new FormData(F));
- const r=await fetch('/api/'+T+'/camera',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)});
- $('camst').textContent=r.ok?'Αποθηκεύτηκε ✓':'Σφάλμα αποθήκευσης';if(r.ok)loadCam();};
-$('snap').onclick=async()=>{const o=$('snapout');o.innerHTML='<p class="hint" style="margin-top:12px">Σύνδεση με την κάμερα…</p>';
- const r=await fetch('/api/'+T+'/camera/snapshot',{method:'POST'});
- if(r.ok&&(r.headers.get('content-type')||'').startsWith('image/')){o.innerHTML='<img src="'+URL.createObjectURL(await r.blob())+'" alt=""><p class="hint">Η κάμερα απαντά ✓ '+fmt(Date.now())+'</p>';}
- else{let d={};try{d=await r.json()}catch{}o.innerHTML='<p class="err">'+esc(d.error||('Σφάλμα '+r.status))+'</p>'+(d.url?'<p class="hint">'+esc(d.url)+'</p>':'');}};
-loadCam();
 </script></body></html>`;
 }
