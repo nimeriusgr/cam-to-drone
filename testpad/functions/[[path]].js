@@ -246,7 +246,6 @@ input,select{background:#0b1219;color:var(--tx);border:1px solid var(--line);bor
 <section class="alarm" id="alarm"><div class="waiting"><b>Σε αναμονή συναγερμού</b>Μόλις η κάμερα στείλει σήμα, εμφανίζεται εδώ με ήχο.</div></section>
 <section><h3>ΙΣΤΟΡΙΚΟ ΣΗΜΑΤΩΝ</h3><table><thead><tr><th>Ώρα</th><th>Συμβάν</th><th class="hide-m">Κανάλι</th><th class="hide-m">IP</th><th>Κατάσταση</th></tr></thead><tbody id="rows"><tr><td colspan="5" style="color:var(--mut)">Κανένα σήμα ακόμα.</td></tr></tbody></table></section>
 <section class="card"><h3>ΣΤΟΙΧΕΙΑ ΚΑΜΕΡΑΣ</h3>
-<p class="hint">Ζητήστε από τον πελάτη: μάρκα, εξωτερική IP ή DDNS, θύρα HTTP, θύρα RTSP, όνομα χρήστη και κωδικό (καλύτερα ξεχωριστός χρήστης μόνο για προβολή), κανάλι αν είναι NVR.</p>
 <form id="camf" class="grid">
 <label>Μάρκα<select name="brand"><option>Hikvision</option><option>Dahua</option><option>Άλλη</option></select></label>
 <label>Χώρος / περιγραφή<input name="site" placeholder="π.χ. Αποθήκη, πύλη φόρτωσης"></label>
