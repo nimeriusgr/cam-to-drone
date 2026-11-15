@@ -255,7 +255,6 @@ input,select{background:#0b1219;color:var(--tx);border:1px solid var(--line);bor
 <label>Κανάλι<input name="channel" inputmode="numeric" placeholder="1"></label>
 <label>Όνομα χρήστη<input name="username" autocomplete="off"></label>
 <label>Κωδικός<input name="password" type="password" autocomplete="new-password" placeholder=""></label>
-<label class="wide">Σημειώσεις<input name="notes" placeholder="π.χ. μοντέλο, router, ποιος έχει πρόσβαση"></label>
 <div class="wide row"><button type="submit">Αποθήκευση</button><button type="button" class="ghost" id="snap">Δοκιμή σύνδεσης (λήψη εικόνας)</button><span id="camst" class="hint"></span></div>
 </form><div id="snapout"></div></section>
 <details><summary>Ρύθμιση κάμερας</summary>
@@ -304,7 +303,7 @@ for(const i of [$('sfrom'),$('sto')]){i.onfocus=()=>editing=true;i.onblur=()=>ed
 poll();
 const F=$('camf');
 async function loadCam(){const c=await (await fetch('/api/'+T+'/camera',{cache:'no-store'})).json();
- for(const k of ['brand','site','host','http_port','rtsp_port','channel','username','notes'])if(F[k])F[k].value=c[k]||(k==='brand'?'Hikvision':'');
+ for(const k of ['brand','site','host','http_port','rtsp_port','channel','username'])if(F[k])F[k].value=c[k]||(k==='brand'?'Hikvision':'');
  F.password.value='';F.password.placeholder=c.has_password?'αποθηκευμένος (αφήστε κενό)':'';
  $('camst').textContent=c.updated?'Αποθηκεύτηκε '+fmt(c.updated):'';}
 F.onsubmit=async e=>{e.preventDefault();const b=Object.fromEntries(new FormData(F));
