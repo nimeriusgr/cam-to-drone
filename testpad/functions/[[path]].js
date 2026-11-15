@@ -289,11 +289,10 @@ for(const id of ['sfrom','sto']){const sel=$(id);for(let m=0;m<1440;m+=30){const
 const MODES={armed:'ΟΠΛΙΣΜΕΝΟ',disarmed:'ΑΦΟΠΛΙΣΜΕΝΟ'};let editing=false;
 function armUI(a){$('arm').className='arm '+(a.armed?'on':'off');$('armic').textContent=a.armed?'⛨':'○';
  $('armtxt').textContent=MODES[a.armed?'armed':'disarmed']+(a.mode==='schedule'?' · ΩΡΑΡΙΟ':'');
- $('armwho').textContent=(a.mode==='schedule'?'Οπλισμένο '+a.from+'–'+a.to+'. ':'')+(a.changed?'Αλλαγή'+(a.by?' από '+a.by:'')+', '+fmt(a.changed):'');
+ $('armwho').textContent=(a.mode==='schedule'?'Οπλισμένο '+a.from+'–'+a.to+'. ':'')+(a.changed?'Τελευταία αλλαγή: '+fmt(a.changed):'');
  for(const b of document.querySelectorAll('.seg button'))b.className=b.dataset.m===a.mode?'sel':'';
  $('sched').hidden=a.mode!=='schedule';if(!editing){for(const [id,v] of [['sfrom',a.from],['sto',a.to]]){const sel=$(id);if(![...sel.options].some(o=>o.value===v))sel.add(new Option(v,v));sel.value=v;}}}
-function who(){let n='';try{n=localStorage.getItem('skw_name')||''}catch{}if(!n){n=(prompt('Το όνομά σας (για το ιστορικό αλλαγών):')||'').trim();try{if(n)localStorage.setItem('skw_name',n)}catch{}}return n;}
-async function setArm(mode){const r=await fetch('/api/'+T+'/arm',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode,from:$('sfrom').value,to:$('sto').value,by:who()})});if(r.ok)armUI(await r.json());}
+async function setArm(mode){const r=await fetch('/api/'+T+'/arm',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode,from:$('sfrom').value,to:$('sto').value})});if(r.ok)armUI(await r.json());}
 for(const b of document.querySelectorAll('.seg button'))b.onclick=()=>setArm(b.dataset.m);
 for(const i of [$('sfrom'),$('sto')]){i.onfocus=()=>editing=true;i.onblur=()=>editing=false;i.onchange=()=>{editing=false;setArm('schedule')};}
 poll();
