@@ -1,0 +1,9 @@
+name = "skywarden-test"
+pages_build_output_dir = "public"
+compatibility_date = "2025-06-01"
+
+# Mini camera test (Adesco). Secret HOOK_TOKEN: local in .dev.vars, live via `wrangler pages secret put HOOK_TOKEN`.
+[[d1_databases]]
+binding = "DB"
+database_name = "skywarden-test"
+database_id = "233bfe2c-cb6b-409a-8267-d37a7f124474"
