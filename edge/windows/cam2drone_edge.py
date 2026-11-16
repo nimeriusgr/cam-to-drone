@@ -70,10 +70,15 @@ def stop_agent():
     pid = running_pid()
     if pid and pid > 0:  # /T also ends go2rtc and ffmpeg started by the agent
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, creationflags=NOWIN)
-        for _ in range(30):
-            if not running_pid():
-                break
-            time.sleep(0.2)
+    # the one-file program runs as two processes (launcher + agent): end every copy of the installed program,
+    # otherwise the launcher keeps the file locked and the new version cannot replace it
+    # (not this window itself, nor its own launcher, when it was opened from the installed copy)
+    subprocess.run(["taskkill", "/F", "/IM", os.path.basename(EXE), "/FI", f"PID ne {os.getpid()}", "/FI", f"PID ne {os.getppid()}"],
+                   capture_output=True, creationflags=NOWIN)
+    for _ in range(30):
+        if not running_pid():
+            break
+        time.sleep(0.2)
 
 
 def start_agent():
@@ -99,11 +104,14 @@ def install(cfg):
     stop_agent()
     me = os.path.abspath(sys.executable)
     if getattr(sys, "frozen", False) and os.path.normcase(me) != os.path.normcase(EXE):
-        for _ in range(10):
+        for k in range(20):
             try:
                 shutil.copy2(me, EXE)
                 break
             except PermissionError:  # the old agent may need a moment to exit
+                if k == 19:
+                    raise RuntimeError("Δεν ήταν δυνατή η αντικατάσταση της παλιάς έκδοσης. Κλείστε το Cam2DroneEdge από τη "
+                                       "Διαχείριση Εργασιών (Ctrl+Shift+Esc) και πατήστε ξανά «Εγκατάσταση και εκκίνηση».")
                 time.sleep(0.5)
     tmp = CONFIG + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
