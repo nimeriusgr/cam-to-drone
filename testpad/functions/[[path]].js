@@ -284,7 +284,7 @@ async function edgeApi(request, env, p) {
   if (p === '/api/edge/poll') return j(await edgePoll(db, box));
   if (p === '/api/edge/command') {
     const q = await db.prepare('SELECT id FROM bcmd WHERE id=? AND box_id=?').bind(+b.id || 0, box.id).first(); if (!q) return j({ error: 'Άγνωστη εντολή' }, 404);
-    await db.prepare('UPDATE bcmd SET status=?, result=? WHERE id=?').bind(b.ok ? 'done' : 'failed', JSON.stringify(b.ok ? b.result ?? null : { error: String(b.error || 'αποτυχία').slice(0, 300) }).slice(0, 32000), q.id).run();
+    await db.prepare('UPDATE bcmd SET status=?, result=? WHERE id=?').bind(b.ok ? 'done' : 'failed', JSON.stringify(b.ok ? b.result ?? null : { error: String(b.error || 'αποτυχία').slice(0, 3000) }).slice(0, 32000), q.id).run();
     return j({ ok: true });
   }
   if (p === '/api/edge/event') {  // the box's alarms show on the test page like the camera's own
@@ -339,7 +339,7 @@ async function adminApi(request, env, p, url) {
     await db.prepare('DELETE FROM box WHERE id=?').bind(+m[1]).run();
     return j({ ok: true });
   }
-  m = p.match(/^\/cam\/(\d+)\/(live|frame|webrtc)$/);
+  m = p.match(/^\/cam\/(\d+)\/(live|frame|webrtc|diag)$/);
   if (!m) return j({ error: 'Δεν βρέθηκε' }, 404);
   const cam = await db.prepare('SELECT c.*, b.last_seen AS box_seen FROM bcam c JOIN box b ON b.id=c.box_id WHERE c.id=?').bind(+m[1]).first();
   if (!cam) return j({ error: 'Δεν βρέθηκε' }, 404);
@@ -350,6 +350,16 @@ async function adminApi(request, env, p, url) {
   }
   await db.prepare('UPDATE bcam SET live_until=? WHERE id=?').bind(now + LIVE_MS, cam.id).run(); // the box polls fast and sends pictures
   if (m[2] === 'live') return j({ ok: true, box_online: boxOnline, p2p: boxOnline && webrtc, frame_ts: cam.frame_ts || null });
+  if (m[2] === 'diag') {  // the box reports what it runs and whether the camera accepts a video connection on each stream
+    if (post) {
+      const r = await db.prepare('INSERT INTO bcmd (box_id,cam_id,cmd,args,created) VALUES (?,?,?,?,?)').bind(cam.box_id, cam.id, 'diag', '{}', now).run();
+      return j({ ok: true, id: r.meta.last_row_id });
+    }
+    const q = await db.prepare("SELECT status, result FROM bcmd WHERE id=? AND cam_id=? AND cmd='diag'").bind(+url.searchParams.get('id') || 0, cam.id).first();
+    if (!q) return j({ error: 'Δεν βρέθηκε' }, 404);
+    let r = null; try { r = JSON.parse(q.result || 'null'); } catch { }
+    return j({ status: q.status, text: q.status === 'done' && r ? r.text : null, error: q.status === 'failed' && r ? r.error : null });
+  }
   if (post) {
     const b = await request.json().catch(() => ({})), sdp = String(b.sdp || '');
     if (!webrtc) return j({ error: 'Το κουτί δεν έχει ζωντανό βίντεο' }, 409);
@@ -397,6 +407,8 @@ code{background:#0b1219;border:1px solid var(--line);padding:3px 8px;border-radi
 <main>
 <section class="card" id="vcard" hidden><div class="row" style="margin-bottom:10px"><h3 style="margin:0" id="vtitle">ΖΩΝΤΑΝΑ</h3><button class="ghost sm" id="vstop" style="margin-left:auto">Κλείσιμο</button></div>
 <div class="viewer" id="viewer"></div></section>
+<section class="card" id="dcard" hidden><div class="row" style="margin-bottom:10px"><h3 style="margin:0" id="dtitle">ΔΙΑΓΝΩΣΗ</h3><button class="ghost sm" id="dclose" style="margin-left:auto">Κλείσιμο</button></div>
+<pre id="dtext" style="margin:0;white-space:pre-wrap;word-break:break-word;font:13px/1.5 Consolas,monospace;color:var(--tx)"></pre></section>
 <section class="card"><h3>ΚΟΥΤΙΑ</h3>
 <p class="hint">Στο <b>Cam2Drone-Setup.exe</b> βάλτε «Κέντρο»: <code id="srv"></code> και «Κωδικός κουτιού»: τον κωδικό του κουτιού από εδώ.</p>
 <div id="boxes"><p class="hint" style="margin-top:12px">Φόρτωση…</p></div>
@@ -415,15 +427,26 @@ async function load(){try{const d=await api('/boxes');$('srv').textContent=d.ser
  (b.version&&b.version!==d.latest?(b.update_req?'<span class="hint">Ενημέρωση σε '+esc(d.latest)+'…</span>':'<button class="sm" data-upd="'+b.id+'">Ενημέρωση σε '+esc(d.latest)+'</button>'):'')+
  '<button class="ghost sm" data-del="'+b.id+'" style="margin-left:auto">Διαγραφή</button></div>'+
  '<div class="cams">'+(b.cameras.length?b.cameras.map(c=>'<div class="cam"><span class="dot'+(c.online?' on':'')+'"></span><div class="n">'+esc(c.name)+'<br><small>'+(c.webrtc?'Ζωντανό βίντεο':'Εικόνα ανά δευτερόλεπτο')+'</small></div>'+
+  '<button class="ghost sm" data-diag="'+c.id+'" data-name="'+esc(c.name)+'"'+(b.online?'':' disabled')+'>Διάγνωση</button>'+
   '<button class="sm" data-live="'+c.id+'" data-name="'+esc(c.name)+'"'+(b.online?'':' disabled')+'>Ζωντανά</button></div>').join(''):'<p class="hint">Δεν έχουν δηλωθεί κάμερες ακόμα. Εγκαταστήστε το κουτί με αυτόν τον κωδικό.</p>')+'</div></div>').join('')
  :'<p class="hint" style="margin-top:12px">Δεν υπάρχει κουτί. Δώστε ένα όνομα και πατήστε «Νέο κουτί».</p>';
  for(const x of document.querySelectorAll('[data-copy]'))x.onclick=async()=>{try{await navigator.clipboard.writeText(x.dataset.copy);x.textContent='Αντιγράφηκε ✓'}catch{}};
  for(const x of document.querySelectorAll('[data-upd]'))x.onclick=async()=>{x.disabled=true;x.textContent='Στάλθηκε…';await api('/boxes/'+x.dataset.upd+'/update',{});load()};
  for(const x of document.querySelectorAll('[data-del]'))x.onclick=async()=>{if(confirm('Διαγραφή κουτιού; Το κουτί δεν θα μπορεί πια να συνδεθεί.')){await api('/boxes/'+x.dataset.del+'/delete',{});load()}};
  for(const x of document.querySelectorAll('[data-live]'))x.onclick=()=>startLive(+x.dataset.live,x.dataset.name);
+ for(const x of document.querySelectorAll('[data-diag]'))x.onclick=()=>diag(+x.dataset.diag,x.dataset.name);
  }catch(e){$('boxes').innerHTML='<p class="hint">'+esc(e.message)+'</p>'}}
 $('badd').onclick=async()=>{await api('/boxes',{name:$('bname').value});$('bname').value='';load()};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+$('dclose').onclick=()=>{$('dcard').hidden=true};
+async function diag(cam,name){$('dcard').hidden=false;$('dtitle').textContent='ΔΙΑΓΝΩΣΗ · '+name.toUpperCase();const t=$('dtext');
+ t.textContent='Το κουτί ελέγχει την κάμερα… (έως 1 λεπτό)';
+ try{const {id}=await api('/cam/'+cam+'/diag',{});
+  for(let k=0;k<90;k++){await sleep(1500);const r=await api('/cam/'+cam+'/diag?id='+id);
+   if(r.status==='done'){t.textContent=r.text||'(κενή απάντηση)';return}
+   if(r.status==='failed'){t.textContent=/άγνωστη|ONVIF/i.test(r.error||'')?'Το κουτί έχει παλιά έκδοση και δεν ξέρει τη διάγνωση. Ενημερώστε το πρώτα.':'Σφάλμα: '+r.error;return}
+   if(r.status==='expired'){t.textContent='Το κουτί δεν πήρε την εντολή (εκτός σύνδεσης;).';return}}
+  t.textContent='Το κουτί δεν απάντησε εγκαίρως.'}catch(e){t.textContent=e.message}}
 function stopLive(){if(live){live.dead=true;clearInterval(live.timer);if(live.pc)live.pc.close();live=null}$('viewer').innerHTML='';$('vcard').hidden=true}
 $('vstop').onclick=stopLive;
 async function startLive(cam,name){stopLive();const me=live={cam};$('vcard').hidden=false;$('vtitle').textContent='ΖΩΝΤΑΝΑ · '+name.toUpperCase();

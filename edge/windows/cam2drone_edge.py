@@ -28,6 +28,9 @@ import agent as BUILTIN  # noqa: E402  (edge/agent.py, the copy inside this prog
 
 APP = "Cam2Drone"
 HOME = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), APP)
+CUSTOM_HOME = "--home" in sys.argv[1:-1]  # another install folder (tests)
+if CUSTOM_HOME:
+    HOME = os.path.abspath(sys.argv[sys.argv.index("--home") + 1])
 
 
 def load_agent():
@@ -74,6 +77,8 @@ def run_agent():
         f.write(str(os.getpid()))
     sys.argv = [sys.argv[0], "--config", CONFIG, "--log", LOG]
     A.RESTART_CMD = [EXE, "--run"] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__), "--run"]
+    if CUSTOM_HOME:
+        A.RESTART_CMD += ["--home", HOME]
     try:
         A.main()
     except Exception:  # noqa: BLE001

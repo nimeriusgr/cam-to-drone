@@ -39,12 +39,19 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.5.5"
+VERSION = "1.5.6"
 log = logging.getLogger("edge")
 
 FROZEN = getattr(sys, "frozen", False)  # Windows build (PyInstaller): no self-update, tools bundled next to the program
 APP_DIR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}  # no console window for ffmpeg / go2rtc on Windows
+STARTED_FLAG = os.path.join(APP_DIR, "agent.started")
+if os.name == "nt" and "--run" in sys.argv and (FROZEN or __name__ == "agent_update"):
+    try:  # read by the previous agent during an update: it exits only after the new one has come up
+        with open(STARTED_FLAG, "w") as _f:
+            _f.write(f"{os.getpid()} {time.time():.0f}")
+    except OSError:
+        pass
 for _d in (os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "bin"), os.path.join(APP_DIR, "bin")):
     if os.path.isdir(_d) and _d not in os.environ.get("PATH", "").split(os.pathsep):
         os.environ["PATH"] = _d + os.pathsep + os.environ.get("PATH", "")
@@ -64,7 +71,7 @@ RAW_MAP = {
 
 def redact(text):
     """Hide user:password@ in addresses before a message leaves the box (errors shown in the console)."""
-    return re.sub(r"(\w+://)[^/@\s]*@", r"***@", str(text))
+    return re.sub(r"(\w+://)[^/@\s]*@", r"\1***@", str(text))
 
 
 def norm(raw, target=None):
@@ -601,6 +608,17 @@ class OnvifControl:
 
 
 # ------------------------------------------------------------------ real-time video without a media server
+def stream_alternatives(url):
+    """The camera's other streams, tried when it refuses the sub-stream: Hikvision main (01) and third (03), Dahua main."""
+    alts = [url]
+    m = re.search(r"(/Streaming/Channels/\d+)02(?=$|[?#])", url)
+    if m:
+        alts += [url[:m.start()] + m.group(1) + x + url[m.end():] for x in ("01", "03")]
+    elif "subtype=1" in url:
+        alts.append(url.replace("subtype=1", "subtype=0"))
+    return alts
+
+
 class Go2rtc:
     """go2rtc (github.com/AlexxIT/go2rtc, MIT licence) runs next to the agent and turns each camera's RTSP stream into
     WebRTC. The console's offer and go2rtc's answer travel through the central server as a camera command ("webrtc"),
@@ -660,7 +678,7 @@ class Go2rtc:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.read()
         except urllib.error.HTTPError as e:  # go2rtc says why (camera refused, codec...): pass it on to the console
-            why = e.read()[:300].decode("utf-8", "replace").strip()
+            why = e.read()[:3000].decode("utf-8", "replace").strip()
             raise RuntimeError(redact(f"go2rtc {e.code} {path.split('?')[0]}: {why or e.reason}")) from None
 
     def ensure(self, key):
@@ -676,13 +694,7 @@ class Go2rtc:
                     # cannot handle): video as is, sound to Opus; the second source is used only for H.265 cameras
                     # H.265 cameras: the H.264 copy is made from the connection already open (cameras refuse a second one)
                     # if the camera refuses the sub-stream ("453 Not Enough Bandwidth"), go2rtc tries the next one
-                    alts = [url]
-                    m = re.search(r"(/Streaming/Channels/\d+)02(?=$|[?#])", url)
-                    if m:  # Hikvision: main stream 01, third stream 03
-                        alts += [url[:m.start()] + m.group(1) + x + url[m.end():] for x in ("01", "03")]
-                    elif "subtype=1" in url:  # Dahua: main stream
-                        alts.append(url.replace("subtype=1", "subtype=0"))
-                    srcs = [f"ffmpeg:{u}#video=copy#audio=opus" for u in alts] + [f"ffmpeg:{n}#video=h264"]
+                    srcs = [f"ffmpeg:{u}#video=copy#audio=opus" for u in stream_alternatives(url)] + [f"ffmpeg:{n}#video=h264"]
                 else:
                     srcs = [url + "#backchannel=0"]  # no two-way audio request: many cameras refuse it
                 q = "name=" + quote(n, safe="") + "".join("&src=" + quote(x, safe="") for x in srcs)
@@ -1032,7 +1044,9 @@ class Agent:
         key, cmd, args = c.get("camera_key"), c.get("cmd"), c.get("args") or {}
         ctl = self.controls.get(key)
         try:
-            if cmd == "webrtc":
+            if cmd == "diag":
+                result = {"text": self.diagnose(key)}
+            elif cmd == "webrtc":
                 if not (self.g2r and self.g2r.ready()):
                     raise RuntimeError("το κουτί δεν έχει ζωντανό βίντεο (λείπει το go2rtc)")
                 result = {"sdp": self.g2r.answer(key, str(args.get("sdp") or ""))}
@@ -1049,12 +1063,66 @@ class Agent:
             body = {"id": c["id"], "ok": True, "result": result}
             log.info("[%s] command %s ok", key, cmd)
         except Exception as e:  # noqa: BLE001
-            body = {"id": c["id"], "ok": False, "error": redact(e)[:300]}
+            body = {"id": c["id"], "ok": False, "error": redact(e)[:3000 if cmd in ("webrtc", "diag") else 300]}
             log.warning("[%s] command %s failed: %s", key, cmd, e)
         try:
             self.up.post("/api/edge/command", body, timeout=10)
         except Exception as e:  # noqa: BLE001
             log.warning("command result not delivered: %s", e)
+
+    def diagnose(self, key):
+        """What stands between this camera and live video, as text for the console: programs running on this computer,
+        what go2rtc has open, and whether the camera accepts a video connection right now on each of its streams."""
+        out = [f"agent {VERSION} · {time.strftime('%d/%m %H:%M:%S')} · {socket.gethostname()}"]
+        w = self.by_key(key)
+        url = w and w.rtsp(w.channel_of(key))
+        if os.name == "nt":
+            try:
+                t = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, timeout=20, **NOWIN).stdout.decode("utf-8", "replace")
+                seen = {}
+                for line in t.splitlines():
+                    n = line.split('","')[0].strip('"').lower()
+                    if any(x in n for x in ("ffmpeg", "go2rtc", "cam2drone", "ivms", "vlc", "hik", "sadp", "nvr")):
+                        seen[n] = seen.get(n, 0) + 1
+                out.append("programs here: " + (", ".join(f"{n} x{c}" for n, c in sorted(seen.items())) or "none of interest"))
+            except Exception as e:  # noqa: BLE001
+                out.append(f"programs here: {e}")
+        out.append("clip recorder: " + ("on" if key in self.recorders else "off"))
+        if self.g2r and self.g2r.ready():
+            try:
+                st = (json.loads(self.g2r._req("GET", "/api/streams", timeout=3) or b"{}") or {}).get(Go2rtc.name(key))
+                if st is None:
+                    out.append("go2rtc: stream not opened yet")
+                else:
+                    prods, cons = st.get("producers") or [], st.get("consumers") or []
+                    out.append(f"go2rtc: {len(prods)} sources, {sum(1 for p in prods if p.get('medias') or p.get('receivers'))} connected, {len(cons)} viewers")
+            except Exception as e:  # noqa: BLE001
+                out.append(f"go2rtc: {redact(e)[:200]}")
+        else:
+            out.append("go2rtc: not running")
+        ff = shutil.which("ffmpeg")
+        if not url:
+            out.append("camera: no RTSP address")
+        elif not ff:
+            out.append("camera: ffmpeg missing, cannot test")
+        else:
+            for u in stream_alternatives(url):
+                label = redact(u).split("@")[-1]
+                try:  # only opens the stream and reads what it carries; no output file, so ffmpeg ends at once
+                    p = subprocess.run([ff, "-hide_banner", "-rtsp_transport", "tcp", "-timeout", "8000000", "-i", u],
+                                       capture_output=True, timeout=20, **NOWIN)
+                    err = p.stderr.decode("utf-8", "replace")
+                    streams = re.findall(r"Stream #\d+:\d+[^:]*: ((?:Video|Audio): [^\n\r]{0,80})", err)
+                    if streams:
+                        out.append(f"{label}: OPENS · " + " · ".join(x.strip() for x in streams))
+                    else:
+                        lines = [x.strip() for x in err.splitlines() if x.strip() and "At least one output" not in x]
+                        out.append(f"{label}: REFUSED · " + redact(" | ".join(lines[-2:]))[:300])
+                except subprocess.TimeoutExpired:
+                    out.append(f"{label}: no answer in 20 s")
+                except Exception as e:  # noqa: BLE001
+                    out.append(f"{label}: {redact(e)[:200]}")
+        return "\n".join(out)
 
     def caps_for(self, key):
         """What the console may ask of this camera: ONVIF control plus real-time video when go2rtc runs."""
@@ -1121,15 +1189,64 @@ class Agent:
 RESTART_CMD = None  # set by the Windows program: how to start the agent again
 
 
+def restart_by_wmi():
+    """Starts the new agent through WMI (the system creates the process; it is no child of this one)."""
+    q = lambda x: str(x).replace("'", "''")  # noqa: E731
+    ps = ("$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='%s'; CurrentDirectory='%s'}; "
+          "exit $r.ReturnValue") % (q(subprocess.list2cmdline(RESTART_CMD)), q(APP_DIR))
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, timeout=40, **NOWIN)
+    if r.returncode != 0:
+        log.warning("wmi: %s", (r.stderr or r.stdout).decode("utf-8", "replace").strip()[:300] or r.returncode)
+    return r.returncode == 0
+
+
+def restart_direct():
+    """Starts the new agent from this process: a fresh unpack (PYINSTALLER_RESET_ENVIRONMENT), no DLL folder inherited."""
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetDllDirectoryW(None)
+    except Exception:  # noqa: BLE001
+        pass
+    env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+    flags = 0x00000008 | 0x00000200 | 0x08000000  # detached, own group, no window
+    try:  # outside this process's job, if it is in one and the job allows it
+        subprocess.Popen(RESTART_CMD, close_fds=True, cwd=APP_DIR, creationflags=flags | 0x01000000, env=env)
+    except OSError:
+        subprocess.Popen(RESTART_CMD, close_fds=True, cwd=APP_DIR, creationflags=flags, env=env)
+    return True
+
+
 def restart_windows():
-    """Ends this agent's ffmpeg / go2rtc, starts a new agent (which waits for this one to exit) and exits."""
-    ps = f"Get-CimInstance Win32_Process -Filter 'ParentProcessId={os.getpid()}' | ForEach-Object {{ taskkill /F /T /PID $_.ProcessId }}"
-    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, timeout=60, **NOWIN)
-    # PYINSTALLER_RESET_ENVIRONMENT: the new program must unpack itself afresh, not reuse this one's folder (deleted on exit)
-    subprocess.Popen(RESTART_CMD, close_fds=True, cwd=APP_DIR, creationflags=0x00000008 | 0x00000200 | 0x08000000,
-                     env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"})
-    logging.shutdown()
-    os._exit(0)
+    """Starts a new agent and exits, but only after the new one has reported that it is up (it writes agent.started
+    when loaded, then waits for this one to exit). First through WMI: that agent is independent of this process. One
+    started directly is a child of this process and, in the field and in tests, died with it. If neither comes up,
+    raises: this agent keeps running, so a failed update never leaves the site without a box.
+    (No scheduled task: antivirus software treats a program that registers one as malware.)"""
+    for name, start in (("wmi", restart_by_wmi), ("direct start", restart_direct)):
+        try:
+            os.remove(STARTED_FLAG)
+        except OSError:
+            pass
+        try:
+            if not start():
+                continue
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s: %s", name, e)
+            continue
+        for _ in range(60):  # the one-file program needs a few seconds to unpack
+            if os.path.exists(STARTED_FLAG):
+                log.info("the new agent is up (%s), handing over", name)
+                ps = (f"Get-CimInstance Win32_Process -Filter 'ParentProcessId={os.getpid()}' | "
+                      "Where-Object { $_.Name -in 'ffmpeg.exe','go2rtc.exe' } | ForEach-Object { taskkill /F /T /PID $_.ProcessId }")
+                try:  # only this agent's ffmpeg / go2rtc: the new agent may be a child of this process too
+                    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, timeout=12, **NOWIN)
+                except Exception:  # noqa: BLE001
+                    pass
+                logging.shutdown()
+                os._exit(0)
+            time.sleep(0.5)
+        log.warning("%s: the new agent did not come up in 30 s", name)
+    raise RuntimeError("the new agent could not be started; this one keeps running (it loads at the next start)")
 
 
 def version_tuple(v):

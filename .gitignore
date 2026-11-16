@@ -22,3 +22,4 @@ testpad/.wrangler/
 edge/windows/bin/
 edge/windows/build/
 edge/windows/dist/
+edge/agent.started
