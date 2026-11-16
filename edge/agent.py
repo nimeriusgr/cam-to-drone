@@ -39,7 +39,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.4.3"
+VERSION = "1.5.0"
 log = logging.getLogger("edge")
 
 FROZEN = getattr(sys, "frozen", False)  # Windows build (PyInstaller): no self-update, tools bundled next to the program
@@ -896,13 +896,14 @@ class Agent:
             threading.Thread(target=self.run_command, args=(c,), daemon=True, name=f"cmd-{c.get('id')}").start()
         ag = res.get("agent") or {}
         auto = self.cfg.get("auto_update", True)
-        if ag.get("version") and ag.get("sha256") and ag["sha256"] != self.update_failed and not FROZEN:
+        if ag.get("version") and ag.get("sha256") and ag["sha256"] != self.update_failed and (not FROZEN or RESTART_CMD):
             newer = version_tuple(ag["version"]) > version_tuple(VERSION)
             if (res.get("update") and ag["version"] != VERSION) or (auto and newer):
                 self.self_update(ag)
 
     def self_update(self, ag):
-        """Downloads agent.py from the server, checks the hash and that it starts, then replaces itself and restarts."""
+        """Downloads agent.py from the server, checks the hash and that it starts, then replaces itself and restarts.
+        Windows program: saves it next to the program (which loads it instead of its built-in copy) and restarts."""
         me = os.path.abspath(__file__)
         log.info("updating agent %s -> %s", VERSION, ag["version"])
         try:
@@ -910,6 +911,15 @@ class Agent:
             digest = hashlib.sha256(data).hexdigest()
             if digest != ag["sha256"] or headers.get("X-Agent-Sha256", digest) != digest:
                 raise RuntimeError("hash mismatch")
+            if FROZEN:
+                compile(data, "agent.py", "exec")  # at least valid Python; the program falls back to its own copy if it fails to start
+                dest = os.path.join(APP_DIR, "agent.py")
+                with open(dest + ".new", "wb") as f:
+                    f.write(data)
+                os.replace(dest + ".new", dest)
+                log.info("update saved, restarting")
+                restart_windows()
+                return
             fd, tmp = tempfile.mkstemp(prefix="agent-", suffix=".py", dir=os.path.dirname(me))
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
@@ -1069,6 +1079,18 @@ class Agent:
         threading.Thread(target=self.frame_loop, daemon=True, name="frames").start()
         log.info("edge agent %s started with %d sources", VERSION, len(self.workers))
         self.control_loop()
+
+
+RESTART_CMD = None  # set by the Windows program: how to start the agent again
+
+
+def restart_windows():
+    """Ends this agent's ffmpeg / go2rtc, starts a new agent (which waits for this one to exit) and exits."""
+    ps = f"Get-CimInstance Win32_Process -Filter 'ParentProcessId={os.getpid()}' | ForEach-Object {{ taskkill /F /T /PID $_.ProcessId }}"
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, timeout=60, **NOWIN)
+    subprocess.Popen(RESTART_CMD, close_fds=True, cwd=APP_DIR, creationflags=0x00000008 | 0x00000200 | 0x08000000)
+    logging.shutdown()
+    os._exit(0)
 
 
 def version_tuple(v):

@@ -24,10 +24,30 @@ import urllib.request
 import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import agent as A  # noqa: E402  (edge/agent.py)
+import agent as BUILTIN  # noqa: E402  (edge/agent.py, the copy inside this program)
 
 APP = "Cam2Drone"
 HOME = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), APP)
+
+
+def load_agent():
+    """The agent sent by the centre ("Ενημέρωση" button) is saved as HOME\agent.py; use it when it is newer."""
+    import importlib.util
+    path = os.path.join(HOME, "agent.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            m = re.search(r'^VERSION = "([^"]+)"', f.read(), re.M)
+        if m and BUILTIN.version_tuple(m.group(1)) > BUILTIN.version_tuple(BUILTIN.VERSION):
+            spec = importlib.util.spec_from_file_location("agent_update", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    except Exception:  # noqa: BLE001  (missing or broken: the built-in copy runs)
+        pass
+    return BUILTIN
+
+
+A = load_agent()
 EXE = os.path.join(HOME, "Cam2DroneEdge.exe")
 CONFIG = os.path.join(HOME, "config.json")
 LOG = os.path.join(HOME, "agent.log")
@@ -41,15 +61,32 @@ NOWIN = 0x08000000
 # ------------------------------------------------------------------ background agent
 def run_agent():
     lock = socket.socket()
-    try:
-        lock.bind(("127.0.0.1", LOCK_PORT))  # one agent per computer
-    except OSError:
-        return
+    for k in range(40):  # one agent per computer; after an update the previous one needs a moment to exit
+        try:
+            lock.bind(("127.0.0.1", LOCK_PORT))
+            break
+        except OSError:
+            if k == 39:
+                return
+            time.sleep(0.5)
     os.makedirs(HOME, exist_ok=True)
     with open(PIDFILE, "w") as f:
         f.write(str(os.getpid()))
     sys.argv = [sys.argv[0], "--config", CONFIG, "--log", LOG]
-    A.main()
+    A.RESTART_CMD = [EXE, "--run"] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__), "--run"]
+    try:
+        A.main()
+    except Exception:  # noqa: BLE001
+        if A is BUILTIN:
+            raise
+        # the updated agent does not start: put it aside and run the built-in one
+        try:
+            os.replace(os.path.join(HOME, "agent.py"), os.path.join(HOME, "agent.py.bad"))
+        except OSError:
+            pass
+        BUILTIN.RESTART_CMD = A.RESTART_CMD
+        BUILTIN.log.exception("updated agent failed, running the built-in %s", BUILTIN.VERSION)
+        BUILTIN.main()
 
 
 def running_pid():
