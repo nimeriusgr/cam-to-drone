@@ -765,8 +765,8 @@ class Agent:
         self.update_failed = None
         self.g2r = Go2rtc(self, os.path.dirname(os.path.abspath(self.up.spool))) if cfg.get("webrtc", True) else None
         clips = cfg.get("clips") or {}
-        self.clip_pre = float(clips.get("pre_seconds", 5))
-        self.clip_post = float(clips.get("post_seconds", 5))
+        self.clip_pre = float(clips.get("pre_seconds", 10))
+        self.clip_post = float(clips.get("post_seconds", 10))
         self.clips_on = bool(clips.get("enabled", False))
 
     def by_key(self, key):

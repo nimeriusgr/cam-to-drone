@@ -6,7 +6,7 @@
   "throttle_seconds": 10,
   "local_webhook_port": 8090,
   "auto_update": true,
-  "clips": { "enabled": true, "pre_seconds": 5, "post_seconds": 5 },
+  "clips": { "enabled": true, "pre_seconds": 10, "post_seconds": 10 },
   "cameras": [
     {
       "key": "nvr1", "name": "NVR Hikvision", "kind": "hikvision",

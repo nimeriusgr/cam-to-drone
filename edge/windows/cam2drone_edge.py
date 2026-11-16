@@ -292,7 +292,7 @@ def build_config(server, token, user, password, devices):
         cams.append(c)
     return {"server": server.rstrip("/"), "token": token, "verify_tls": True, "heartbeat_seconds": 30, "throttle_seconds": 10,
             "local_webhook_port": 0, "auto_update": False, "webrtc": True,
-            "clips": {"enabled": True, "pre_seconds": 5, "post_seconds": 5}, "cameras": cams}
+            "clips": {"enabled": True, "pre_seconds": 10, "post_seconds": 10}, "cameras": cams}
 
 
 # ------------------------------------------------------------------ window
