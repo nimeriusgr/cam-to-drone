@@ -482,22 +482,61 @@ def media_url(tpl, path):
 STUN = [{"urls": "stun:stun.cloudflare.com:3478"}, {"urls": "stun:stun.l.google.com:19302"}]
 
 
+# Monthly cap: relay only while this month's TURN traffic for the key is under TURN_LIMIT_GB (default 900, inside the
+# free 1,000 GB). Usage from Cloudflare analytics (env CF_ACCOUNT_ID, CF_ANALYTICS_TOKEN with Account Analytics: Read),
+# checked at most every 10 minutes. If usage cannot be read, no relay is offered, so the cap is never passed by mistake.
+_turn_usage = {"t": 0.0, "gb": None, "error": None}
+
+
+def _post_json(url, token, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.loads(r.read().decode())
+
+
+def turn_usage_gb():
+    if time.time() - _turn_usage["t"] < 600:
+        return _turn_usage
+    now = datetime.utcnow()
+    query = ("query($acc:String!,$key:String!,$start:Date!,$end:Date!){viewer{accounts(filter:{accountTag:$acc}){"
+             "callsTurnUsageAdaptiveGroups(limit:10,filter:{keyId:$key,date_geq:$start,date_leq:$end}){sum{egressBytes ingressBytes}}}}}")
+    try:
+        d = _post_json("https://api.cloudflare.com/client/v4/graphql", os.environ.get("CF_ANALYTICS_TOKEN"), {
+            "query": query, "variables": {"acc": os.environ.get("CF_ACCOUNT_ID"), "key": os.environ.get("TURN_KEY_ID"),
+                                          "start": now.strftime("%Y-%m-01"), "end": now.strftime("%Y-%m-%d")}})
+        if d.get("errors"):
+            raise RuntimeError(str(d["errors"][0].get("message", "analytics error"))[:160])
+        accs = ((d.get("data") or {}).get("viewer") or {}).get("accounts") or [{}]
+        rows = accs[0].get("callsTurnUsageAdaptiveGroups") or []
+        total = sum(float((x.get("sum") or {}).get("egressBytes") or 0) + float((x.get("sum") or {}).get("ingressBytes") or 0) for x in rows)
+        _turn_usage.update(t=time.time(), gb=round(total / 1e9, 2), error=None)
+    except Exception as e:  # retry in 1 minute
+        _turn_usage.update(t=time.time() - 540, gb=None, error=str(e)[:200])
+    return _turn_usage
+
+
 def ice_servers():
     kid, tok = os.environ.get("TURN_KEY_ID"), os.environ.get("TURN_KEY_TOKEN")
     if not kid or not tok:
         return {"iceServers": STUN, "relay": False}
+    limit = float(os.environ.get("TURN_LIMIT_GB") or 900)
+    if not os.environ.get("CF_ACCOUNT_ID") or not os.environ.get("CF_ANALYTICS_TOKEN"):
+        return {"iceServers": STUN, "relay": False, "limit_gb": limit, "error": "Δεν έχει οριστεί το token για τη μέτρηση του relay"}
+    u = turn_usage_gb()
+    if u["gb"] is None:
+        return {"iceServers": STUN, "relay": False, "limit_gb": limit, "error": "Η χρήση του relay δεν διαβάστηκε: " + str(u["error"])}
+    if u["gb"] >= limit:
+        return {"iceServers": STUN, "relay": False, "used_gb": u["gb"], "limit_gb": limit, "error": "Το relay έφτασε το μηνιαίο όριο"}
     try:
-        req = urllib.request.Request(
-            f"https://rtc.live.cloudflare.com/v1/turn/keys/{kid}/credentials/generate-ice-servers",
-            data=json.dumps({"ttl": 4 * 3600}).encode(), method="POST",
-            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            got = json.loads(r.read().decode())
+        got = _post_json(f"https://rtc.live.cloudflare.com/v1/turn/keys/{kid}/credentials/generate-ice-servers", tok, {"ttl": 4 * 3600})
         lst = got.get("iceServers") or []
         lst = [lst] if isinstance(lst, dict) else [x for x in lst if x]
-        return {"iceServers": lst, "relay": True} if lst else {"iceServers": STUN, "relay": False}
+        out = {"iceServers": lst, "relay": True} if lst else {"iceServers": STUN, "relay": False}
+        out.update(used_gb=u["gb"], limit_gb=limit)
+        return out
     except Exception as e:  # network, auth or certificate problems: fall back to STUN
-        return {"iceServers": STUN, "relay": False, "error": str(e)[:200]}
+        return {"iceServers": STUN, "relay": False, "used_gb": u["gb"], "limit_gb": limit, "error": str(e)[:200]}
 
 
 def media_play(kind, ident):

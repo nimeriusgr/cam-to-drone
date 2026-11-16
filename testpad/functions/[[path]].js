@@ -379,16 +379,43 @@ async function adminApi(request, env, p, url) {
 // through Cloudflare's TURN relay. Secrets TURN_KEY_ID / TURN_KEY_TOKEN: Cloudflare dashboard → Realtime → TURN Server.
 // Without them the page uses STUN only, as before.
 const STUN = [{ urls: 'stun:stun.cloudflare.com:3478' }, { urls: 'stun:stun.l.google.com:19302' }];
+// Monthly cap: relay is offered only while this month's TURN traffic for the key is under TURN_LIMIT_GB (default 900,
+// inside Cloudflare's free 1,000 GB). Usage comes from Cloudflare's analytics API (secrets CF_ACCOUNT_ID and
+// CF_ANALYTICS_TOKEN with Account Analytics: Read), checked at most every 10 minutes. If usage cannot be read,
+// no relay is offered (STUN only), so the cap can never be passed by mistake.
+let turnUsage = { t: 0, gb: null, error: null };
+async function turnUsageGB(env) {
+  if (Date.now() - turnUsage.t < 600e3) return turnUsage;
+  const now = new Date(), start = `${now.toISOString().slice(0, 7)}-01`, end = now.toISOString().slice(0, 10);
+  const query = `query($acc:String!,$key:String!,$start:Date!,$end:Date!){viewer{accounts(filter:{accountTag:$acc}){
+    callsTurnUsageAdaptiveGroups(limit:10,filter:{keyId:$key,date_geq:$start,date_leq:$end}){sum{egressBytes ingressBytes}}}}}`;
+  try {
+    const r = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+      method: 'POST', headers: { authorization: `Bearer ${env.CF_ANALYTICS_TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ query, variables: { acc: env.CF_ACCOUNT_ID, key: env.TURN_KEY_ID, start, end } }), signal: AbortSignal.timeout(5000) });
+    const d = await r.json();
+    if (d.errors && d.errors.length) throw new Error(String(d.errors[0].message || 'analytics error').slice(0, 160));
+    const rows = d.data?.viewer?.accounts?.[0]?.callsTurnUsageAdaptiveGroups || [];
+    const bytes = rows.reduce((a, x) => a + (+x.sum?.egressBytes || 0) + (+x.sum?.ingressBytes || 0), 0);
+    turnUsage = { t: Date.now(), gb: Math.round(bytes / 1e7) / 100, error: null };
+  } catch (e) { turnUsage = { t: Date.now() - 540e3, gb: null, error: String(e.message || e) }; } // retry in 1 minute
+  return turnUsage;
+}
 async function iceServers(env) {
   if (!env.TURN_KEY_ID || !env.TURN_KEY_TOKEN) return { iceServers: STUN, relay: false };
+  const limit = +(env.TURN_LIMIT_GB || 900);
+  if (!env.CF_ACCOUNT_ID || !env.CF_ANALYTICS_TOKEN) return { iceServers: STUN, relay: false, limit_gb: limit, error: 'Δεν έχει οριστεί το token για τη μέτρηση του relay' };
+  const u = await turnUsageGB(env);
+  if (u.gb === null) return { iceServers: STUN, relay: false, limit_gb: limit, error: 'Η χρήση του relay δεν διαβάστηκε: ' + u.error };
+  if (u.gb >= limit) return { iceServers: STUN, relay: false, used_gb: u.gb, limit_gb: limit, error: 'Το relay έφτασε το μηνιαίο όριο' };
   try {
     const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
       method: 'POST', headers: { authorization: `Bearer ${env.TURN_KEY_TOKEN}`, 'content-type': 'application/json' },
       body: JSON.stringify({ ttl: 4 * 3600 }), signal: AbortSignal.timeout(5000) });
-    if (!r.ok) return { iceServers: STUN, relay: false, error: `TURN ${r.status}` };
+    if (!r.ok) return { iceServers: STUN, relay: false, used_gb: u.gb, limit_gb: limit, error: `TURN ${r.status}` };
     const list = [].concat((await r.json()).iceServers || []).filter(Boolean);
-    return list.length ? { iceServers: list, relay: true } : { iceServers: STUN, relay: false };
-  } catch (e) { return { iceServers: STUN, relay: false, error: String(e.message || e) }; }
+    return list.length ? { iceServers: list, relay: true, used_gb: u.gb, limit_gb: limit } : { iceServers: STUN, relay: false, used_gb: u.gb, limit_gb: limit };
+  } catch (e) { return { iceServers: STUN, relay: false, used_gb: u.gb, limit_gb: limit, error: String(e.message || e) }; }
 }
 
 // ------------------------------------------------------------------ admin page
