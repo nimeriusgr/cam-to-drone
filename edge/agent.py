@@ -39,8 +39,15 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 log = logging.getLogger("edge")
+
+FROZEN = getattr(sys, "frozen", False)  # Windows build (PyInstaller): no self-update, tools bundled next to the program
+APP_DIR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
+NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}  # no console window for ffmpeg / go2rtc on Windows
+for _d in (os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "bin"), os.path.join(APP_DIR, "bin")):
+    if os.path.isdir(_d) and _d not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = _d + os.pathsep + os.environ.get("PATH", "")
 
 # ------------------------------------------------------------------ type normalisation (same names as the server)
 RAW_MAP = {
@@ -588,6 +595,92 @@ class OnvifControl:
             return {}
 
 
+# ------------------------------------------------------------------ real-time video without a media server
+class Go2rtc:
+    """go2rtc (github.com/AlexxIT/go2rtc, MIT licence) runs next to the agent and turns each camera's RTSP stream into
+    WebRTC. The console's offer and go2rtc's answer travel through the central server as a camera command ("webrtc"),
+    so nothing on this site listens on the internet; the video then flows directly to the browser (peer to peer, STUN).
+    Active only when the go2rtc program is found (next to the agent, in bin/, or on PATH)."""
+    API = "http://127.0.0.1:1984"
+
+    def __init__(self, agent, data_dir):
+        self.agent, self.dir = agent, os.path.join(data_dir, "go2rtc")
+        self.bin = shutil.which("go2rtc")
+        self.proc = None
+        self.added = {}
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def name(key):
+        return re.sub(r"[^\w-]", "_", key)
+
+    def ready(self):
+        return bool(self.proc and self.proc.poll() is None)
+
+    def start(self):
+        if not self.bin:
+            return False
+        os.makedirs(self.dir, exist_ok=True)
+        cfg = {"api": {"listen": self.API.split("//")[1]}, "rtsp": {"listen": ""}, "srtp": {"listen": ""},
+               "webrtc": {"listen": ":8555", "candidates": ["stun:8555"],
+                          "ice_servers": [{"urls": ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"]}]},
+               "ffmpeg": {"bin": shutil.which("ffmpeg") or "ffmpeg"}, "log": {"level": "warn"}}
+        path = os.path.join(self.dir, "go2rtc.yaml")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=1)  # JSON is valid YAML
+        threading.Thread(target=self.keep, args=(path,), daemon=True, name="go2rtc").start()
+        for _ in range(50):
+            if self.ready():
+                break
+            time.sleep(0.1)
+        return True
+
+    def keep(self, path):
+        while True:
+            self.added = {}
+            with open(os.path.join(self.dir, "go2rtc.log"), "ab") as logf:
+                self.proc = subprocess.Popen([self.bin, "-config", path], stdout=logf, stderr=logf, cwd=self.dir, **NOWIN)
+                log.info("go2rtc started (real-time video)")
+                self.proc.wait()
+            log.warning("go2rtc stopped (%s), restarting in 5s", self.proc.returncode)
+            time.sleep(5)
+
+    def _req(self, method, path, data=None, ctype=None, timeout=10):
+        req = urllib.request.Request(self.API + path, data=data, method=method, headers={"Content-Type": ctype} if ctype else {})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+
+    def ensure(self, key):
+        w = self.agent.by_key(key)
+        url = w and w.rtsp(w.channel_of(key))
+        if not url:
+            raise RuntimeError("δεν υπάρχει διεύθυνση RTSP για την κάμερα")
+        n = self.name(key)
+        with self.lock:
+            if self.added.get(n) != url:
+                q = "name=" + quote(n, safe="") + "&src=" + quote(url, safe="")
+                if shutil.which("ffmpeg"):
+                    q += "&src=" + quote(f"ffmpeg:{n}#audio=opus", safe="")  # camera sound (G.711/AAC) -> Opus for the browser
+                    q += "&src=" + quote(f"ffmpeg:{n}#video=h264", safe="")  # used only if the camera sends H.265, which browsers cannot play
+                self._req("PUT", "/api/streams?" + q)
+                self.added[n] = url
+        return n
+
+    def answer(self, key, sdp):
+        if not sdp.startswith("v=0"):
+            raise RuntimeError("άκυρο αίτημα βίντεο")
+        n = self.ensure(key)
+        return self._req("POST", "/api/webrtc?src=" + quote(n, safe=""), sdp.encode(), "application/sdp", timeout=20).decode()
+
+    def watched(self):
+        """Stream names someone is watching right now (go2rtc consumers)."""
+        try:
+            st = json.loads(self._req("GET", "/api/streams", timeout=2) or b"{}")
+            return {n for n, v in (st or {}).items() if v and v.get("consumers")}
+        except Exception:  # noqa: BLE001
+            return set()
+
+
 # ------------------------------------------------------------------ agent
 class Recorder(threading.Thread):
     """Keeps the last few seconds of one camera in short MPEG-TS segments (ffmpeg, stream copy, no re-encoding),
@@ -613,7 +706,7 @@ class Recorder(threading.Thread):
                    os.path.join(self.dir, "seg%03d.ts")]
             t0 = time.time()
             try:
-                p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=None)
+                p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=None, **NOWIN)
                 err = p.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] if p.stderr else []
                 log.warning("[%s] recording stopped (%s), restarting in %ss", self.key, err[0][:200] if err else p.returncode, backoff)
             except Exception as e:  # noqa: BLE001
@@ -645,7 +738,7 @@ class Recorder(threading.Thread):
                         shutil.copyfileobj(src, out)  # MPEG-TS segments can be joined byte by byte
             mp4 = os.path.join(tmp, "clip.mp4")
             subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-fflags", "+genpts", "-ss", f"{offset:.2f}", "-i", joined,
-                            "-t", f"{pre + post:.2f}", "-c", "copy", "-movflags", "+faststart", mp4], check=True, timeout=60)
+                            "-t", f"{pre + post:.2f}", "-c", "copy", "-movflags", "+faststart", mp4], check=True, timeout=60, **NOWIN)
             with open(mp4, "rb") as f:
                 return f.read()
         except Exception as e:  # noqa: BLE001
@@ -670,6 +763,7 @@ class Agent:
         self.caps = {}      # camera key -> capabilities reported to the server
         self.recorders = {}
         self.update_failed = None
+        self.g2r = Go2rtc(self, os.path.dirname(os.path.abspath(self.up.spool))) if cfg.get("webrtc", True) else None
         clips = cfg.get("clips") or {}
         self.clip_pre = float(clips.get("pre_seconds", 5))
         self.clip_post = float(clips.get("post_seconds", 5))
@@ -726,9 +820,10 @@ class Agent:
                 time.sleep(1)
                 continue
             t0 = time.time()
+            watched = self.g2r.watched() if self.g2r and self.g2r.ready() else set()
             for key in keys:
                 w = self.by_key(key)
-                if not w or self.streaming(key):
+                if not w or self.streaming(key) or Go2rtc.name(key) in watched:
                     continue  # a real video stream is running for this camera, no snapshots needed
                 img, ext = w.snapshot(w.channel_of(key))
                 if img:
@@ -778,7 +873,7 @@ class Agent:
             if not src:
                 log.warning("[%s] no RTSP address for live video (set \"rtsp\" in config.json); sending snapshots", key)
                 continue
-            self.stream_procs[key] = (subprocess.Popen(self.stream_cmd(src, dest), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), time.time())
+            self.stream_procs[key] = (subprocess.Popen(self.stream_cmd(src, dest), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **NOWIN), time.time())
             log.info("[%s] live stream started", key)
 
     def apply(self, res):
@@ -792,7 +887,7 @@ class Agent:
             threading.Thread(target=self.run_command, args=(c,), daemon=True, name=f"cmd-{c.get('id')}").start()
         ag = res.get("agent") or {}
         auto = self.cfg.get("auto_update", True)
-        if ag.get("version") and ag.get("sha256") and ag["sha256"] != self.update_failed:
+        if ag.get("version") and ag.get("sha256") and ag["sha256"] != self.update_failed and not FROZEN:
             newer = version_tuple(ag["version"]) > version_tuple(VERSION)
             if (res.get("update") and ag["version"] != VERSION) or (auto and newer):
                 self.self_update(ag)
@@ -881,15 +976,20 @@ class Agent:
         key, cmd, args = c.get("camera_key"), c.get("cmd"), c.get("args") or {}
         ctl = self.controls.get(key)
         try:
-            if not ctl:
+            if cmd == "webrtc":
+                if not (self.g2r and self.g2r.ready()):
+                    raise RuntimeError("το κουτί δεν έχει ζωντανό βίντεο (λείπει το go2rtc)")
+                result = {"sdp": self.g2r.answer(key, str(args.get("sdp") or ""))}
+            elif not ctl:
                 raise RuntimeError("η κάμερα δεν ελέγχεται μέσω ONVIF από αυτό το κουτί")
-            result = ctl.run(cmd, args)
-            if cmd in ("caps", "ptz_set_preset"):
-                self.caps[key] = result["caps"] if cmd == "caps" else ctl.capabilities()
-                result = {**(result or {}), "caps": self.caps[key]}
-            elif cmd == "ircut" and key in self.caps:  # report the new day/night mode right away
-                self.caps[key] = {**self.caps[key], "ircut": args.get("mode")}
-                result = {**(result or {}), "caps": self.caps[key]}
+            else:
+                result = ctl.run(cmd, args)
+                if cmd in ("caps", "ptz_set_preset"):
+                    self.caps[key] = result["caps"] if cmd == "caps" else ctl.capabilities()
+                    result = {**(result or {}), "caps": self.caps_for(key)}
+                elif cmd == "ircut" and key in self.caps:  # report the new day/night mode right away
+                    self.caps[key] = {**self.caps[key], "ircut": args.get("mode")}
+                    result = {**(result or {}), "caps": self.caps_for(key)}
             body = {"id": c["id"], "ok": True, "result": result}
             log.info("[%s] command %s ok", key, cmd)
         except Exception as e:  # noqa: BLE001
@@ -900,12 +1000,21 @@ class Agent:
         except Exception as e:  # noqa: BLE001
             log.warning("command result not delivered: %s", e)
 
+    def caps_for(self, key):
+        """What the console may ask of this camera: ONVIF control plus real-time video when go2rtc runs."""
+        caps = dict(self.caps.get(key) or {})
+        w = self.by_key(key)
+        if self.g2r and self.g2r.ready() and w and not isinstance(w, GpioWorker) and w.rtsp(w.channel_of(key)):
+            caps["webrtc"] = True
+        return caps
+
     def heartbeat(self):
         cams = []
         for w in self.workers:
             online = w.connected if not isinstance(w, PushCamera) else (time.time() - getattr(w, "last", 0) < 3600 or getattr(w, "last", 0) == 0)
             for key, name in w.keys():
-                cams.append({"key": key, "name": name, "online": bool(online), **({"caps": self.caps[key]} if key in self.caps else {})})
+                caps = self.caps_for(key)
+                cams.append({"key": key, "name": name, "online": bool(online), **({"caps": caps} if caps else {})})
         res = self.up.post("/api/edge/heartbeat", {"version": VERSION, "cameras": cams, "hostname": socket.gethostname()})
         self.up.online = True
         skew = abs(res.get("server_time", time.time()) - time.time())
@@ -946,6 +1055,8 @@ class Agent:
             w.start()
         self._recorders()
         self._controls()
+        if self.g2r and not self.g2r.start():
+            log.info("go2rtc not found: live view sends about one picture per second")
         threading.Thread(target=self.frame_loop, daemon=True, name="frames").start()
         log.info("edge agent %s started with %d sources", VERSION, len(self.workers))
         self.control_loop()
@@ -991,8 +1102,13 @@ def main():
     ap.add_argument("--test", action="store_true", help="send one test alarm per configured camera and exit")
     ap.add_argument("--selftest", action="store_true", help="load the config and build the agent, then exit (used by self-update)")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--log", help="write the log to this file (kept under 3 x 2 MB) instead of the console")
     a = ap.parse_args()
-    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    handlers = None
+    if a.log:
+        from logging.handlers import RotatingFileHandler
+        handlers = [RotatingFileHandler(a.log, maxBytes=2_000_000, backupCount=2, encoding="utf-8")]
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
     if a.discover:
         res = discover()
         if not res:

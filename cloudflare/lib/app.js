@@ -713,7 +713,7 @@ class App {
   async commandResult(edge, b) {
     const q = await this.db.q1('SELECT * FROM cam_commands WHERE id=? AND edge_id=?', [+b.id || 0, edge.id]); if (!q) return null;
     const ok = !!b.ok, res = ok ? (b.result ?? null) : { error: String(b.error || 'αποτυχία').slice(0, 300) };
-    await this.db.update('cam_commands', q.id, { status: ok ? 'done' : 'failed', result: JSON.stringify(res).slice(0, 8000), done_ts: now() });
+    await this.db.update('cam_commands', q.id, { status: ok ? 'done' : 'failed', result: JSON.stringify(res).slice(0, q.cmd === 'webrtc' ? 32000 : 8000), done_ts: now() });
     if (ok && res && res.caps && typeof res.caps === 'object') await this.db.update('cameras', q.camera_id, { caps: JSON.stringify(res.caps).slice(0, 8000) });
     if (!ok && q.args && q.args.incident_id) { const c = await this.db.q1('SELECT name FROM cameras WHERE id=?', [q.camera_id]); await this.tl(q.args.incident_id, `Κάμερα «${c.name}»: η εντολή απέτυχε (${res.error})`, 'σύστημα', 'camera'); }
     return { ok: true };
@@ -726,7 +726,7 @@ class App {
   async cameraControl(cam) {
     const edge = cam.edge_id ? await this.db.q1('SELECT last_seen, version FROM edges WHERE id=?', [cam.edge_id]) : null;
     const org = await this.db.q1('SELECT * FROM orgs WHERE id=?', [cam.org_id]), orgArmed = org ? isArmed(org) : null, mode = cam.arming_mode || 'inherit';
-    const recent = []; for (const r of await this.db.q('SELECT id FROM cam_commands WHERE camera_id=? ORDER BY id DESC LIMIT 8', [cam.id])) recent.push(await this.commandView(r.id));
+    const recent = []; for (const r of await this.db.q("SELECT id FROM cam_commands WHERE camera_id=? AND cmd!='webrtc' ORDER BY id DESC LIMIT 8", [cam.id])) recent.push(await this.commandView(r.id));
     return { id: cam.id, name: cam.name, org_id: cam.org_id, org_name: org ? org.name : '', arming_mode: mode, org_armed: orgArmed,
       armed_now: mode === 'armed' || (mode !== 'disarmed' && !!orgArmed), enabled: cam.enabled, online: cam.online, caps: this.capsOf(cam),
       edge: edge ? { online: !!(edge.last_seen && now() - edge.last_seen < 120), version: edge.version } : null, recent };
@@ -1076,6 +1076,21 @@ class App {
       return json({ ok: true, id: await this.queueCommand(cam, u, b.cmd, b.args || {}) });
     }
     if ((m = p.match(/^\/api\/commands\/(\d+)$/))) { await this.user(true, STAFF); const q = await this.commandView(+m[1]); need(q, 404, 'Δεν βρέθηκε'); return json(q); }
+    // real-time video through the box (go2rtc): the browser's WebRTC offer goes to the box as a command, the answer comes back the same way
+    if ((m = p.match(/^\/api\/cameras\/(\d+)\/webrtc$/))) {
+      const u = await this.user(), vis = await this.visible(u);
+      const cam = await this.db.q1('SELECT * FROM cameras WHERE id=?', [+m[1]]); need(cam && (!vis || vis.has(cam.org_id)), 404, 'Δεν βρέθηκε');
+      need(cam.edge_id && this.capsOf(cam).webrtc, 409, 'Η κάμερα δεν έχει ζωντανό βίντεο μέσω κουτιού');
+      if (method === 'POST') {
+        const b = await this.body(), sdp = String(b.sdp || ''), t = now();
+        need(sdp.startsWith('v=0') && sdp.length < 20000, 400, 'Άκυρο αίτημα βίντεο');
+        await this.db.ex('INSERT INTO live_req(camera_id,until) VALUES(?,?) ON CONFLICT(camera_id) DO UPDATE SET until=excluded.until', [cam.id, t + LIVE_SECONDS]);
+        return json({ ok: true, id: await this.db.insert('cam_commands', { camera_id: cam.id, edge_id: cam.edge_id, cmd: 'webrtc', args: { sdp }, who: u.name, created: t }) });
+      }
+      const q = await this.db.q1("SELECT status, result FROM cam_commands WHERE id=? AND camera_id=? AND cmd='webrtc'", [+this.url.searchParams.get('id') || 0, cam.id]); need(q, 404, 'Δεν βρέθηκε');
+      let r = null; try { r = JSON.parse(q.result || 'null'); } catch { }
+      return json({ status: q.status, sdp: q.status === 'done' && r ? r.sdp : null, error: q.status === 'failed' && r ? r.error : null });
+    }
     // near-live camera image (through the edge box)
     if ((m = p.match(/^\/api\/cameras\/(\d+)\/(live|frame)$/))) {
       const u = await this.user(), vis = await this.visible(u);
@@ -1086,7 +1101,8 @@ class App {
       const fr = await this.db.q1(`SELECT ts, ctype${m[2] === 'frame' ? ', data' : ''} FROM live_frames WHERE camera_id=?`, [cam.id]);
       if (m[2] === 'frame') { need(fr, 404, 'Δεν υπάρχει ακόμα εικόνα'); return new Response(b64d(fr.data), { headers: { 'Content-Type': fr.ctype, 'Cache-Control': 'no-store' } }); }
       const edge = await this.db.q1('SELECT last_seen FROM edges WHERE id=?', [cam.edge_id]);
-      return json({ ok: true, frame_ts: fr ? fr.ts : null, server_time: t, edge_online: !!(edge && edge.last_seen && t - edge.last_seen < 120), whep: await this.mediaPlay('cam', cam.id) });
+      const edgeOnline = !!(edge && edge.last_seen && t - edge.last_seen < 120);
+      return json({ ok: true, frame_ts: fr ? fr.ts : null, server_time: t, edge_online: edgeOnline, whep: await this.mediaPlay('cam', cam.id), p2p: !!(edgeOnline && this.capsOf(cam).webrtc) });
     }
     if ((m = p.match(/^\/api\/incidents\/(\d+)\/action$/)) && method === 'POST') return json(await this.action(+m[1], await this.user(), await this.body()));
     if ((m = p.match(/^\/api\/incidents\/(\d+)\/speaker-audio$/)) && method === 'POST') {

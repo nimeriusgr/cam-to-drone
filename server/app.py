@@ -717,6 +717,31 @@ class Handler(BaseHTTPRequestHandler):
             need(q, 404, "Δεν βρέθηκε")
             return self.send(200, q)
 
+        # real-time video through the box (go2rtc): the browser's WebRTC offer goes to the box as a command, the answer comes back
+        m = re.fullmatch(r"/api/cameras/(\d+)/webrtc", path)
+        if m:
+            u = self.user()
+            cam = db.q1("SELECT * FROM cameras WHERE id=?", (int(m.group(1)),))
+            vis = logic.visible_org_ids(u)
+            need(cam and (vis is None or cam["org_id"] in vis), 404, "Δεν βρέθηκε")
+            need(cam["edge_id"] and features.caps_of(cam).get("webrtc"), 409, "Η κάμερα δεν έχει ζωντανό βίντεο μέσω κουτιού")
+            if method == "POST":
+                sdp = str(self.json_body().get("sdp") or "")
+                need(sdp.startswith("v=0") and len(sdp) < 20000, 400, "Άκυρο αίτημα βίντεο")
+                features.live_request(cam["id"])
+                cid = db.insert("cam_commands", {"camera_id": cam["id"], "edge_id": cam["edge_id"], "cmd": "webrtc", "args": {"sdp": sdp},
+                                                 "who": u["name"], "created": time.time()})
+                return self.send(200, {"ok": True, "id": cid})
+            q = db.q1("SELECT status, result FROM cam_commands WHERE id=? AND camera_id=? AND cmd='webrtc'",
+                      (int((qs.get("id") or ["0"])[0] or 0), cam["id"]))
+            need(q, 404, "Δεν βρέθηκε")
+            try:
+                r = json.loads(q["result"] or "null")
+            except ValueError:
+                r = None
+            return self.send(200, {"status": q["status"], "sdp": r.get("sdp") if q["status"] == "done" and r else None,
+                                   "error": r.get("error") if q["status"] == "failed" and r else None})
+
         # near-live camera image (through the edge box)
         m = re.fullmatch(r"/api/cameras/(\d+)/(live|frame)", path)
         if m:
@@ -731,9 +756,9 @@ class Handler(BaseHTTPRequestHandler):
                 need(fr, 404, "Δεν υπάρχει ακόμα εικόνα")
                 return self.send(200, fr[1], fr[2])
             edge = db.q1("SELECT last_seen FROM edges WHERE id=?", (cam["edge_id"],))
-            return self.send(200, {"ok": True, "frame_ts": fr[0] if fr else None, "server_time": time.time(),
-                                   "edge_online": bool(edge and edge["last_seen"] and time.time() - edge["last_seen"] < 120),
-                                   "whep": features.media_play("cam", cam["id"])})
+            online = bool(edge and edge["last_seen"] and time.time() - edge["last_seen"] < 120)
+            return self.send(200, {"ok": True, "frame_ts": fr[0] if fr else None, "server_time": time.time(), "edge_online": online,
+                                   "whep": features.media_play("cam", cam["id"]), "p2p": bool(online and features.caps_of(cam).get("webrtc"))})
 
         # admin
         m = re.fullmatch(r"/api/admin/(\w+)(?:/(\d+))?", path)

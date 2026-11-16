@@ -19,3 +19,6 @@ cloudflare/credentials-pilot.txt
 # testpad (mini camera test)
 testpad/.dev.vars
 testpad/.wrangler/
+edge/windows/bin/
+edge/windows/build/
+edge/windows/dist/

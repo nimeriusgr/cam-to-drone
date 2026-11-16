@@ -89,8 +89,48 @@
     try { st = await api(`/api/cameras/${cam}/live`); } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
     if (me.dead) return;
     if (st.whep && 'RTCPeerConnection' in window) return startVideo(me, st, box);
+    if (st.p2p && 'RTCPeerConnection' in window) return startP2P(me, box);
     startFrames(me, cam, box);
   };
+  /* real-time video straight from the box (go2rtc): the offer/answer travel through the server as a camera command,
+     the video itself goes peer to peer. Falls back to ~1 frame/s when the direct connection cannot be made. */
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  F.p2p = async (cam, video, dead) => {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }, { urls: 'stun:stun.l.google.com:19302' }] });
+    pc.addTransceiver('video', { direction: 'recvonly' }); pc.addTransceiver('audio', { direction: 'recvonly' });
+    const ms = new MediaStream(); video.srcObject = ms; pc.ontrack = e => ms.addTrack(e.track);
+    try {
+      await pc.setLocalDescription(await pc.createOffer());
+      await new Promise(r => { if (pc.iceGatheringState === 'complete') return r(); const t = setTimeout(r, 2500); pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); r(); } }; });
+      const { id } = await api(`/api/cameras/${cam}/webrtc`, { sdp: pc.localDescription.sdp });
+      for (let k = 0; k < 40; k++) {
+        await sleep(k < 3 ? 1500 : 1000); if (dead()) throw new Error('stopped');
+        const r = await api(`/api/cameras/${cam}/webrtc?id=${id}`);
+        if (r.status === 'failed' || r.status === 'expired') throw new Error(r.error ? 'Το κουτί: ' + r.error : 'Το κουτί δεν απάντησε');
+        if (r.status !== 'done' || !r.sdp) continue;
+        await pc.setRemoteDescription({ type: 'answer', sdp: r.sdp });
+        await new Promise((ok, bad) => {
+          const t = setTimeout(() => bad(new Error('Δεν έγινε απευθείας σύνδεση με το κουτί')), 15000);
+          const chk = () => { if (pc.connectionState === 'connected') { clearTimeout(t); ok(); } else if (pc.connectionState === 'failed') { clearTimeout(t); bad(new Error('Δεν έγινε απευθείας σύνδεση με το κουτί')); } };
+          pc.onconnectionstatechange = chk; chk();
+        });
+        return () => pc.close();
+      }
+      throw new Error('Το κουτί δεν απάντησε');
+    } catch (e) { pc.close(); throw e; }
+  };
+  async function startP2P(me, box) {
+    box.innerHTML = F.videoHtml('Σύνδεση με την κάμερα μέσω του κουτιού…'); F.bindSound(box);
+    const v = $('video', box), msg = $('.live-msg', box);
+    v.onplaying = () => { msg.hidden = true; };
+    me.timer = setInterval(() => api(`/api/cameras/${me.cam}/live`).catch(() => { }), 10000); // keeps the box answering quickly
+    try { const close = await F.p2p(me.cam, v, () => me.dead); if (me.dead) close(); else me.close = close; }
+    catch (e) {
+      if (me.dead) return;
+      clearInterval(me.timer); msg.hidden = false; msg.textContent = `${e.message}. Εμφάνιση εικόνας ανά δευτερόλεπτο.`;
+      setTimeout(() => !me.dead && live === me && startFrames(me, me.cam, box), 2000);
+    }
+  }
   async function startVideo(me, st, box) {
     box.innerHTML = F.videoHtml('Το κουτί ξεκινά τη ροή βίντεο…'); F.bindSound(box);
     const v = $('video', box), msg = $('.live-msg', box);

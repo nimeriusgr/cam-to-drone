@@ -621,7 +621,8 @@ def command_result(edge, body):
         return None
     ok = bool(body.get("ok"))
     res = body.get("result") if ok else {"error": str(body.get("error") or "αποτυχία")[:300]}
-    db.update("cam_commands", q["id"], {"status": "done" if ok else "failed", "result": json.dumps(res, ensure_ascii=False)[:8000], "done_ts": time.time()})
+    db.update("cam_commands", q["id"], {"status": "done" if ok else "failed", "result": json.dumps(res, ensure_ascii=False)[:32000 if q["cmd"] == "webrtc" else 8000],
+                                          "done_ts": time.time()})
     if ok and isinstance(res, dict) and isinstance(res.get("caps"), dict):
         db.update("cameras", q["camera_id"], {"caps": json.dumps(res["caps"], ensure_ascii=False)[:8000]})
     if not ok and (q["args"] or {}).get("incident_id"):
@@ -648,7 +649,7 @@ def camera_control(cam):
             "armed_now": cam.get("arming_mode") == "armed" or (cam.get("arming_mode") != "disarmed" and bool(org and logic.is_armed(org))),
             "enabled": cam["enabled"], "online": cam["online"], "caps": caps_of(cam),
             "edge": {"online": bool(edge and edge["last_seen"] and time.time() - edge["last_seen"] < 120), "version": edge["version"]} if edge else None,
-            "recent": [command_view(r["id"]) for r in db.q("SELECT id FROM cam_commands WHERE camera_id=? ORDER BY id DESC LIMIT 8", (cam["id"],))]}
+            "recent": [command_view(r["id"]) for r in db.q("SELECT id FROM cam_commands WHERE camera_id=? AND cmd!='webrtc' ORDER BY id DESC LIMIT 8", (cam["id"],))]}
 
 
 # ================================================================== technical alerts: box or camera stops answering

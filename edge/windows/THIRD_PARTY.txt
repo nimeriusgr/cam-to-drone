@@ -1,0 +1,10 @@
+Cam to Drone edge (Windows) includes these separate programs, unmodified:
+
+go2rtc  - https://github.com/AlexxIT/go2rtc
+  Copyright (c) Alexey Khit. MIT License.
+
+FFmpeg  - https://ffmpeg.org  (build: https://github.com/BtbN/FFmpeg-Builds, LGPL variant)
+  Licensed under the GNU Lesser General Public License v2.1 or later.
+  Source code: https://github.com/FFmpeg/FFmpeg  (build scripts: https://github.com/BtbN/FFmpeg-Builds)
+
+onvif-zeep / zeep (Python, MIT License) and the Python runtime (PSF License) are included in the program.
