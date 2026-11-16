@@ -251,7 +251,9 @@ const b64bytes = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
 
 async function edgeApi(request, env, p) {
   const db = env.DB; await ensure(db);
-  const tok = (request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  // typed by hand: ignore case, spaces and missing dashes (codes look like ABCD-EFGH-JKLM)
+  const raw = (request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const tok = raw.length === 12 ? raw.match(/.{4}/g).join('-') : '';
   const box = tok && await db.prepare('SELECT * FROM box WHERE token=?').bind(tok).first();
   if (!box) return j({ error: 'Άγνωστος κωδικός κουτιού' }, 401);
   const now = Date.now();
