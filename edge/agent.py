@@ -39,7 +39,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.5.8"
+VERSION = "1.5.9"
 log = logging.getLogger("edge")
 
 FROZEN = getattr(sys, "frozen", False)  # Windows build (PyInstaller): no self-update, tools bundled next to the program
@@ -625,6 +625,60 @@ def stream_alternatives(url):
     return alts
 
 
+def probe_stream(url, transport="tcp"):
+    """Asks the camera for a video connection and closes it at once. Returns (state, text):
+    "ok" (text: what the stream carries), "refused" (the camera answered but said no; text: its reason, e.g.
+    "method SETUP failed: 453 (Not Enough Bandwidth)") or "unreachable" (no answer, no ffmpeg...)."""
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        return "unreachable", "ffmpeg missing"
+    try:  # no output file: ffmpeg opens the stream, prints what it carries and ends
+        p = subprocess.run([ff, "-hide_banner", "-rtsp_transport", transport, "-timeout", "8000000", "-i", url],
+                           capture_output=True, timeout=20, **NOWIN)
+    except subprocess.TimeoutExpired:
+        return "unreachable", "no answer in 20 s"
+    except Exception as e:  # noqa: BLE001
+        return "unreachable", redact(e)[:200]
+    err = p.stderr.decode("utf-8", "replace")
+    video = re.search(r"Stream #\d+:\d+[^:]*: Video: (\w+)[^\n\r]*?(\d{2,5}x\d{2,5})[^\n\r]*?(?:, ([\d.]+) fps)?", err)
+    if video:
+        return "ok", " ".join(x for x in (video.group(1).upper().replace("H264", "H.264").replace("HEVC", "H.265"), video.group(2),
+                                          f"{video.group(3)} fps" if video.group(3) else "") if x)
+    m = re.search(r"method \w+ failed: \d{3}[^\r\n]*", err) or re.search(r"Server returned (?:\d{3}|4XX|5XX)[^\r\n]*", err)
+    if m:
+        return "refused", redact(m.group(0))[:200]
+    lines = [x.strip() for x in err.splitlines() if x.strip() and "At least one output" not in x]
+    return "unreachable", redact(" | ".join(lines[-1:]))[:200]
+
+
+def refusal_text(reason):
+    """The camera's refusal in the operator's words."""
+    code = (re.search(r"\b(\d{3})\b", reason) or [None, ""])[1]
+    if code == "453":
+        return "δεν έχει ελεύθερη σύνδεση βίντεο (453)"
+    if code in ("401", "403"):
+        return f"δεν δέχεται τον χρήστη/κωδικό για βίντεο ({code})"
+    if code == "404":
+        return "δεν έχει αυτή τη ροή βίντεο (404)"
+    return f"αρνήθηκε τη σύνδεση βίντεο ({code or reason[:60]})"
+
+
+def hik_sessions(opener, base):
+    """Hikvision: how many video sessions the camera has open and from which addresses. (total, text) or None."""
+    try:
+        with opener.open(base + "/ISAPI/Streaming/status", timeout=6) as r:
+            body = r.read(200_000).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return None
+    total = re.search(r"<totalStreamingSessions>(\d+)<", body)
+    by = {}
+    for ip in re.findall(r"<ipAddress>([^<]+)<", body):
+        by[ip] = by.get(ip, 0) + 1
+    n = int(total.group(1)) if total else sum(by.values())
+    who = ", ".join(f"{ip} ×{c}" for ip, c in sorted(by.items(), key=lambda x: -x[1]))
+    return n, f"{n} ανοιχτές συνδέσεις" + (f": {who}" if who else "")
+
+
 class Go2rtc:
     """go2rtc (github.com/AlexxIT/go2rtc, MIT licence) runs next to the agent and turns each camera's RTSP stream into
     WebRTC. The console's offer and go2rtc's answer travel through the central server as a camera command ("webrtc"),
@@ -719,6 +773,14 @@ class Go2rtc:
         n = self.ensure(key)
         return self._req("POST", "/api/webrtc?src=" + quote(n, safe=""), sdp.encode(), "application/sdp", timeout=20).decode()
 
+    def connected(self):
+        """Stream names whose camera connection is open right now."""
+        try:
+            st = json.loads(self._req("GET", "/api/streams", timeout=2) or b"{}")
+            return {n for n, v in (st or {}).items() if v and any(p.get("medias") or p.get("receivers") for p in v.get("producers") or [])}
+        except Exception:  # noqa: BLE001
+            return set()
+
     def watched(self):
         """Stream names someone is watching right now (go2rtc consumers)."""
         try:
@@ -811,6 +873,7 @@ class Agent:
         self.recorders = {}
         self.update_failed = None
         self.g2r = Go2rtc(self, os.path.dirname(os.path.abspath(self.up.spool))) if cfg.get("webrtc", True) else None
+        self.video = {}  # camera key -> {"state": "ok" | "refused", "why": text}: can the camera give us video right now
         clips = cfg.get("clips") or {}
         self.clip_pre = float(clips.get("pre_seconds", 10))
         self.clip_post = float(clips.get("post_seconds", 10))
@@ -1155,7 +1218,44 @@ class Agent:
         w = self.by_key(key)
         if self.g2r and self.g2r.ready() and w and not isinstance(w, GpioWorker) and w.rtsp(w.channel_of(key)):
             caps["webrtc"] = True
+        if key in self.video:
+            caps["video"] = self.video[key]
         return caps
+
+    def video_loop(self):
+        """Every few minutes: does each camera accept a video connection? Cameras allow a limited number of them, and other
+        programs at the site (recorders, viewing software) can use them all up; the console then shows why live video is
+        missing before an operator needs it. Reported with the heartbeat. Only where this box offers live video."""
+        every = float(self.cfg.get("video_check_minutes", 10)) * 60
+        if every <= 0:
+            return
+        time.sleep(min(30, every))
+        while True:
+            if self.g2r and self.g2r.ready() and shutil.which("ffmpeg"):
+                open_now = self.g2r.connected()
+                for w in self.workers:
+                    if isinstance(w, GpioWorker):
+                        continue
+                    for key, _ in w.keys():
+                        url = w.rtsp(w.channel_of(key))
+                        if not url:
+                            continue
+                        if Go2rtc.name(key) in open_now:  # we already hold a connection: it works
+                            state, text = "ok", ""
+                        else:
+                            state, text = probe_stream(url)
+                        if state == "ok":
+                            new = {"state": "ok"}
+                        elif state == "refused":
+                            why = refusal_text(text)
+                            who = hik_sessions(w.opener(), w.base()) if isinstance(w, HikvisionWorker) else None
+                            new = {"state": "refused", "why": (why + (" · " + who[1] if who else ""))[:300]}
+                        else:
+                            continue  # camera unreachable: the camera-offline alert covers that
+                        if new != self.video.get(key):
+                            log.info("[%s] video connection: %s %s", key, new["state"], new.get("why", ""))
+                        self.video[key] = new
+            time.sleep(every)
 
     def heartbeat(self):
         cams = []
@@ -1207,6 +1307,7 @@ class Agent:
         self._recorders()
         self._controls()
         threading.Thread(target=self.frame_loop, daemon=True, name="frames").start()
+        threading.Thread(target=self.video_loop, daemon=True, name="video-check").start()
         log.info("edge agent %s started with %d sources", VERSION, len(self.workers))
         self.control_loop()
 

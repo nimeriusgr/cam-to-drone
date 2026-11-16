@@ -533,6 +533,13 @@ class App {
     await this.db.update('edges', edge.id, { offline_since: null });
     await this.backOnline(edge.org_id, `Το κουτί «${edge.name}» επικοινωνεί ξανά (εκτός για περίπου ${Math.floor((now() - edge.offline_since) / 60)} λεπτά)`);
   }
+  // the box checks every few minutes whether each camera accepts a video connection (cameras allow a limited number,
+  // and recorders or viewing software at the site can use them all up); `cam` is the row before this heartbeat
+  async videoState(edge, cam, caps) {
+    const was = (this.capsOf(cam).video || {}).state, v = caps && typeof caps === 'object' ? caps.video : null, is = v && v.state;
+    if (is === 'refused' && was !== 'refused') await this.technical(edge.org_id, cam.id, `Η κάμερα «${cam.name}» ${String(v.why || 'αρνείται τη σύνδεση βίντεο').slice(0, 300)}. Συναγερμοί και εικόνα ανά δευτερόλεπτο λειτουργούν, ζωντανό βίντεο όχι.`);
+    else if (was === 'refused' && is === 'ok') await this.backOnline(edge.org_id, `Η κάμερα «${cam.name}» δέχεται ξανά σύνδεση βίντεο`);
+  }
   async cameraState(edge, cam, online) {
     if (!online && !cam.offline_since) {
       await this.db.update('cameras', cam.id, { offline_since: now() });
@@ -714,7 +721,11 @@ class App {
     const q = await this.db.q1('SELECT * FROM cam_commands WHERE id=? AND edge_id=?', [+b.id || 0, edge.id]); if (!q) return null;
     const ok = !!b.ok, res = ok ? (b.result ?? null) : { error: String(b.error || 'αποτυχία').slice(0, 300) };
     await this.db.update('cam_commands', q.id, { status: ok ? 'done' : 'failed', result: JSON.stringify(res).slice(0, q.cmd === 'webrtc' ? 32000 : 8000), done_ts: now() });
-    if (ok && res && res.caps && typeof res.caps === 'object') await this.db.update('cameras', q.camera_id, { caps: JSON.stringify(res.caps).slice(0, 8000) });
+    if (ok && res && res.caps && typeof res.caps === 'object') {
+      const old = this.capsOf(await this.db.q1('SELECT caps FROM cameras WHERE id=?', [q.camera_id]) || {}).video, caps = { ...res.caps };
+      if (old) caps.video = old; else delete caps.video;
+      await this.db.update('cameras', q.camera_id, { caps: JSON.stringify(caps).slice(0, 8000) });
+    }
     if (!ok && q.args && q.args.incident_id) { const c = await this.db.q1('SELECT name FROM cameras WHERE id=?', [q.camera_id]); await this.tl(q.args.incident_id, `Κάμερα «${c.name}»: η εντολή απέτυχε (${res.error})`, 'σύστημα', 'camera'); }
     return { ok: true };
   }
@@ -1177,6 +1188,7 @@ class App {
         if (c.caps && typeof c.caps === 'object' && !Array.isArray(c.caps)) upd.caps = JSON.stringify(c.caps).slice(0, 8000); // ONVIF capabilities
         await this.db.update('cameras', cam.id, upd);
         await this.cameraState(edge, cam, c.online !== false);
+        await this.videoState(edge, cam, c.caps);
       }
       if (edge.update_requested && b.version === AGENT.version) { await this.db.update('edges', edge.id, { update_requested: 0 }); edge.update_requested = 0; }
       return json(await this.edgePoll(edge));

@@ -624,7 +624,12 @@ def command_result(edge, body):
     db.update("cam_commands", q["id"], {"status": "done" if ok else "failed", "result": json.dumps(res, ensure_ascii=False)[:32000 if q["cmd"] == "webrtc" else 8000],
                                           "done_ts": time.time()})
     if ok and isinstance(res, dict) and isinstance(res.get("caps"), dict):
-        db.update("cameras", q["camera_id"], {"caps": json.dumps(res["caps"], ensure_ascii=False)[:8000]})
+        # keep the video state the heartbeat stored, so its change is not missed
+        old = caps_of(db.q1("SELECT caps FROM cameras WHERE id=?", (q["camera_id"],)) or {}).get("video")
+        caps = {k: v for k, v in res["caps"].items() if k != "video"}
+        if old:
+            caps["video"] = old
+        db.update("cameras", q["camera_id"], {"caps": json.dumps(caps, ensure_ascii=False)[:8000]})
     if not ok and (q["args"] or {}).get("incident_id"):
         cam = db.q1("SELECT name FROM cameras WHERE id=?", (q["camera_id"],))
         logic.add_timeline(q["args"]["incident_id"], f"Κάμερα «{cam['name']}»: η εντολή απέτυχε ({res['error']})", "σύστημα", "camera")
@@ -695,6 +700,19 @@ def edge_seen(edge):
         mins = int((time.time() - edge["offline_since"]) / 60)
         db.update("edges", edge["id"], {"offline_since": None})
         back_online(edge["org_id"], f"Το κουτί «{edge['name']}» επικοινωνεί ξανά (εκτός για περίπου {mins} λεπτά)")
+
+
+def video_state(edge, cam, caps):
+    """The box checks every few minutes whether each camera accepts a video connection (cameras allow a limited number,
+    and recorders or viewing software at the site can use them all up). `cam` is the row before this heartbeat."""
+    was = (caps_of(cam).get("video") or {}).get("state")
+    v = caps.get("video") if isinstance(caps, dict) else None
+    now = (v or {}).get("state")
+    if now == "refused" and was != "refused":
+        technical(edge["org_id"], cam["id"], f"Η κάμερα «{cam['name']}» {str(v.get('why') or 'αρνείται τη σύνδεση βίντεο')[:300]}. "
+                                             "Συναγερμοί και εικόνα ανά δευτερόλεπτο λειτουργούν, ζωντανό βίντεο όχι.")
+    elif was == "refused" and now == "ok":
+        back_online(edge["org_id"], f"Η κάμερα «{cam['name']}» δέχεται ξανά σύνδεση βίντεο")
 
 
 def camera_state(edge, cam, online):

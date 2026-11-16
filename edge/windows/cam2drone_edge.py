@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import agent as BUILTIN  # noqa: E402  (edge/agent.py, the copy inside this program)
@@ -257,6 +258,26 @@ def _get(op, url, timeout=5):
 
 
 def identify(ip, user, password):
+    """What is at this address, and whether it gives a video connection right now. Cameras allow a limited number of
+    video connections; recorders and viewing software at the site can use them all up. The installer sees it here,
+    with the addresses that hold them, while still on site."""
+    d = _identify(ip, user, password)
+    if d.get("ok") and d.get("kind") in ("hikvision", "dahua") and hasattr(A, "probe_stream"):
+        ch = next(iter(d.get("channels") or {}), "1")
+        u, pw = quote(user, safe=""), quote(password, safe="")
+        url = (f"rtsp://{u}:{pw}@{ip}:554/Streaming/Channels/{ch}02" if d["kind"] == "hikvision"
+               else f"rtsp://{u}:{pw}@{ip}:554/cam/realmonitor?channel={ch}&subtype=1")
+        state, text = A.probe_stream(url)
+        if state == "ok":
+            d["note"] = "Εντάξει · βίντεο " + text
+        elif state == "refused":
+            who = A.hik_sessions(A.http_opener(user, password, f"http://{ip}"), f"http://{ip}") if d["kind"] == "hikvision" else None
+            d["warn"] = A.refusal_text(text) + (" · " + who[1] if who else "")
+            d["note"] = "Χωρίς ζωντανό βίντεο: " + d["warn"]
+    return d
+
+
+def _identify(ip, user, password):
     """What is at this address: Hikvision / Dahua camera or recorder (with its channels), or a generic ONVIF camera."""
     base = f"http://{ip}"
     op = A.http_opener(user, password, base)
@@ -462,6 +483,12 @@ def gui():
             devices[ip]["use"] = not devices[ip].get("use")
             tree.item(ip, values=row_values(devices[ip]))
 
+    def show_note(_e=None):
+        d = devices.get(tree.focus())
+        if d and d.get("note"):
+            say(f"{d['ip']}: {d['note']}", "#b45309" if d.get("warn") or not d.get("ok") else "#222")
+
+    tree.bind("<<TreeviewSelect>>", show_note)
     tree.bind("<Double-1>", toggle)
     tree.bind("<space>", toggle)
 
@@ -490,8 +517,13 @@ def gui():
                 say(f"Βρέθηκαν {len(found)} συσκευές. Έλεγχος με τον κωδικό…")
                 check([d["ip"] for d in found])
                 ok = sum(1 for d in devices.values() if d.get("ok"))
-                say(f"Έτοιμο: {ok} κάμερες/καταγραφικά αναγνωρίστηκαν." if ok else
-                    "Δεν αναγνωρίστηκε καμία κάμερα. Ελέγξτε χρήστη/κωδικό ή προσθέστε τη διεύθυνση IP.", "#15803d" if ok else "#b45309")
+                warn = [d for d in devices.values() if d.get("warn")]
+                if warn:
+                    say(f"{ok} κάμερες αναγνωρίστηκαν. Προσοχή: {len(warn)} δεν δίνουν ζωντανό βίντεο τώρα "
+                        f"({warn[0]['ip']}: {warn[0]['warn']}). Θα στέλνουν συναγερμούς και εικόνα ανά δευτερόλεπτο.", "#b45309")
+                else:
+                    say(f"Έτοιμο: {ok} κάμερες/καταγραφικά αναγνωρίστηκαν." if ok else
+                        "Δεν αναγνωρίστηκε καμία κάμερα. Ελέγξτε χρήστη/κωδικό ή προσθέστε τη διεύθυνση IP.", "#15803d" if ok else "#b45309")
             finally:
                 root.after(0, lambda: busy(False))
         threading.Thread(target=work, daemon=True).start()
@@ -508,7 +540,9 @@ def gui():
             try:
                 check([ip])
                 d = devices.get(ip, {})
-                say(f"{ip}: {d.get('note') or ('Εντάξει' if d.get('ok') else 'δεν αναγνωρίστηκε')}", "#15803d" if d.get("ok") else "#b45309")
+                say(f"{ip}: {d.get('note') or ('Εντάξει' if d.get('ok') else 'δεν αναγνωρίστηκε')}"
+                    + (". Θα στέλνει συναγερμούς και εικόνα ανά δευτερόλεπτο." if d.get("warn") else ""),
+                    "#15803d" if d.get("ok") and not d.get("warn") else "#b45309")
             finally:
                 root.after(0, lambda: busy(False))
         threading.Thread(target=work, daemon=True).start()

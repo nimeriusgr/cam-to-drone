@@ -321,7 +321,7 @@ async function adminApi(request, env, p, url) {
     const { results: cams } = await db.prepare('SELECT id,box_id,k,name,online,caps,last_seen,frame_ts FROM bcam ORDER BY name').run();
     for (const b of boxes) {
       b.online = !!(b.last_seen && now - b.last_seen < ONLINE_MS);
-      b.cameras = cams.filter(c => c.box_id === b.id).map(c => ({ id: c.id, name: c.name, key: c.k, online: !!c.online && b.online, webrtc: !!JSON.parse(c.caps || '{}').webrtc }));
+      b.cameras = cams.filter(c => c.box_id === b.id).map(c => { const caps = JSON.parse(c.caps || '{}'); return { id: c.id, name: c.name, key: c.k, online: !!c.online && b.online, webrtc: !!caps.webrtc, video: caps.video || null }; });
     }
     return j({ boxes, now, server: url.origin, latest: AGENT.version });
   }
@@ -426,7 +426,7 @@ async function load(){try{const d=await api('/boxes');$('srv').textContent=d.ser
  '<span class="hint">'+(b.online?'Συνδεδεμένο':'Τελευταία επαφή: '+ago(b.last_seen))+(b.version?' · έκδοση '+esc(b.version):'')+(b.host?' · '+esc(b.host):'')+'</span>'+
  (b.version&&b.version!==d.latest?(b.update_req?'<span class="hint">Ενημέρωση σε '+esc(d.latest)+'…</span>':'<button class="sm" data-upd="'+b.id+'">Ενημέρωση σε '+esc(d.latest)+'</button>'):'')+
  '<button class="ghost sm" data-del="'+b.id+'" style="margin-left:auto">Διαγραφή</button></div>'+
- '<div class="cams">'+(b.cameras.length?b.cameras.map(c=>'<div class="cam"><span class="dot'+(c.online?' on':'')+'"></span><div class="n">'+esc(c.name)+'<br><small>'+(c.webrtc?'Ζωντανό βίντεο':'Εικόνα ανά δευτερόλεπτο')+'</small></div>'+
+ '<div class="cams">'+(b.cameras.length?b.cameras.map(c=>'<div class="cam"><span class="dot'+(c.online?' on':'')+'"></span><div class="n">'+esc(c.name)+'<br><small'+(c.video&&c.video.state==='refused'?' style="color:#fbbf24"':'')+'>'+(c.video&&c.video.state==='refused'?'Χωρίς ζωντανό βίντεο: '+esc(c.video.why||'η κάμερα αρνείται τη σύνδεση')+' · εικόνα ανά δευτερόλεπτο':c.webrtc?'Ζωντανό βίντεο':'Εικόνα ανά δευτερόλεπτο')+'</small></div>'+
   '<button class="ghost sm" data-diag="'+c.id+'" data-name="'+esc(c.name)+'"'+(b.online?'':' disabled')+'>Διάγνωση</button>'+
   '<button class="sm" data-live="'+c.id+'" data-name="'+esc(c.name)+'"'+(b.online?'':' disabled')+'>Ζωντανά</button></div>').join(''):'<p class="hint">Δεν έχουν δηλωθεί κάμερες ακόμα. Εγκαταστήστε το κουτί με αυτόν τον κωδικό.</p>')+'</div></div>').join('')
  :'<p class="hint" style="margin-top:12px">Δεν υπάρχει κουτί. Δώστε ένα όνομα και πατήστε «Νέο κουτί».</p>';

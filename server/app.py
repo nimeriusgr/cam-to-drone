@@ -427,6 +427,7 @@ class Handler(BaseHTTPRequestHandler):
                         upd["caps"] = json.dumps(c["caps"], ensure_ascii=False)[:8000]
                     db.update("cameras", cam["id"], upd)
                     features.camera_state(edge, cam, c.get("online", True) is not False)
+                    features.video_state(edge, cam, c.get("caps"))
                     if was != int(bool(c.get("online", True))):
                         logic.publish("camera", org_id=edge["org_id"], id=cam["id"], online=bool(c.get("online", True)))
                 ag = features.agent_info(meta_only=True)
