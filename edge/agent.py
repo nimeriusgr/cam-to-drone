@@ -39,7 +39,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.5.4"
+VERSION = "1.5.5"
 log = logging.getLogger("edge")
 
 FROZEN = getattr(sys, "frozen", False)  # Windows build (PyInstaller): no self-update, tools bundled next to the program
@@ -675,7 +675,14 @@ class Go2rtc:
                     # ffmpeg reads the camera (the same way the clips do, which works with cameras go2rtc's own RTSP client
                     # cannot handle): video as is, sound to Opus; the second source is used only for H.265 cameras
                     # H.265 cameras: the H.264 copy is made from the connection already open (cameras refuse a second one)
-                    srcs = [f"ffmpeg:{url}#video=copy#audio=opus", f"ffmpeg:{n}#video=h264"]
+                    # if the camera refuses the sub-stream ("453 Not Enough Bandwidth"), go2rtc tries the next one
+                    alts = [url]
+                    m = re.search(r"(/Streaming/Channels/\d+)02(?=$|[?#])", url)
+                    if m:  # Hikvision: main stream 01, third stream 03
+                        alts += [url[:m.start()] + m.group(1) + x + url[m.end():] for x in ("01", "03")]
+                    elif "subtype=1" in url:  # Dahua: main stream
+                        alts.append(url.replace("subtype=1", "subtype=0"))
+                    srcs = [f"ffmpeg:{u}#video=copy#audio=opus" for u in alts] + [f"ffmpeg:{n}#video=h264"]
                 else:
                     srcs = [url + "#backchannel=0"]  # no two-way audio request: many cameras refuse it
                 q = "name=" + quote(n, safe="") + "".join("&src=" + quote(x, safe="") for x in srcs)
