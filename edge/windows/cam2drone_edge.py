@@ -119,7 +119,7 @@ def stop_agent():
 
 
 def start_agent():
-    subprocess.Popen([EXE, "--run"], cwd=HOME, close_fds=True,
+    subprocess.Popen([EXE, "--run"], cwd=HOME, close_fds=True, env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"},
                      creationflags=0x00000008 | 0x00000200 | NOWIN)  # detached, own process group, no window
 
 

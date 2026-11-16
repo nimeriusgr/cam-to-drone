@@ -39,7 +39,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.5.0"
+VERSION = "1.5.4"
 log = logging.getLogger("edge")
 
 FROZEN = getattr(sys, "frozen", False)  # Windows build (PyInstaller): no self-update, tools bundled next to the program
@@ -60,6 +60,11 @@ RAW_MAP = {
     "peopledetect": "human", "humandetect": "human", "vehicledetect": "vehicle", "tampering": "tamper",
     "digitalinput": "input", "intrusion": "zone", "tripwire": "line",
 }
+
+
+def redact(text):
+    """Hide user:password@ in addresses before a message leaves the box (errors shown in the console)."""
+    return re.sub(r"(\w+://)[^/@\s]*@", r"***@", str(text))
 
 
 def norm(raw, target=None):
@@ -625,8 +630,10 @@ class Go2rtc:
                "webrtc": {"listen": ":8555", "candidates": ["stun:8555"],
                           "ice_servers": [{"urls": ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"]}]},
                "ffmpeg": {"bin": shutil.which("ffmpeg") or "ffmpeg"}, "log": {"level": "warn"}}
-        if os.name == "nt":  # a go2rtc left over from an earlier run would keep the port with its old settings
+        if os.name == "nt":  # a go2rtc / ffmpeg left over from an earlier run keeps the port, or a camera connection
             subprocess.run(["taskkill", "/F", "/IM", os.path.basename(self.bin)], capture_output=True, **NOWIN)
+            if FROZEN:  # cameras accept few connections ("453 Not Enough Bandwidth"); this computer runs ffmpeg only for us
+                subprocess.run(["taskkill", "/F", "/IM", "ffmpeg.exe"], capture_output=True, **NOWIN)
         path = os.path.join(self.dir, "go2rtc.yaml")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=1)  # JSON is valid YAML
@@ -654,7 +661,7 @@ class Go2rtc:
                 return r.read()
         except urllib.error.HTTPError as e:  # go2rtc says why (camera refused, codec...): pass it on to the console
             why = e.read()[:300].decode("utf-8", "replace").strip()
-            raise RuntimeError(f"go2rtc {e.code} {path.split('?')[0]}: {why or e.reason}") from None
+            raise RuntimeError(redact(f"go2rtc {e.code} {path.split('?')[0]}: {why or e.reason}")) from None
 
     def ensure(self, key):
         w = self.agent.by_key(key)
@@ -667,13 +674,19 @@ class Go2rtc:
                 if shutil.which("ffmpeg"):
                     # ffmpeg reads the camera (the same way the clips do, which works with cameras go2rtc's own RTSP client
                     # cannot handle): video as is, sound to Opus; the second source is used only for H.265 cameras
-                    srcs = [f"ffmpeg:{url}#video=copy#audio=opus", f"ffmpeg:{url}#video=h264#audio=opus"]
+                    # H.265 cameras: the H.264 copy is made from the connection already open (cameras refuse a second one)
+                    srcs = [f"ffmpeg:{url}#video=copy#audio=opus", f"ffmpeg:{n}#video=h264"]
                 else:
                     srcs = [url + "#backchannel=0"]  # no two-way audio request: many cameras refuse it
                 q = "name=" + quote(n, safe="") + "".join("&src=" + quote(x, safe="") for x in srcs)
                 self._req("PUT", "/api/streams?" + q)
                 self.added[n] = url
         return n
+
+    def local_url(self, key):
+        """go2rtc's own RTSP address for this camera (this computer only). The clip recorder reads from here, so the camera
+        sees a single connection; many cameras refuse a second one ("453 Not Enough Bandwidth")."""
+        return f"rtsp://127.0.0.1:8554/{self.ensure(key)}"
 
     def answer(self, key, sdp):
         if not sdp.startswith("v=0"):
@@ -706,9 +719,9 @@ class Recorder(threading.Thread):
     def run(self):
         backoff = 5
         while True:
-            url = self.worker.rtsp(self.channel)
+            url = self.agent.record_source(self.worker, self.key, self.channel)
             if not url:
-                time.sleep(15)  # ONVIF: the address is known after the first connection
+                time.sleep(15)  # ONVIF: the address is known after the first connection; go2rtc may be restarting
                 continue
             cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp", "-i", url, "-map", "0:v:0", "-c", "copy",
                    "-f", "segment", "-segment_time", str(self.SEGMENT), "-segment_wrap", str(self.keep),
@@ -788,6 +801,10 @@ class Agent:
     def _recorders(self):
         if not self.clips_on:
             return
+        if FROZEN and self.g2r and self.g2r.bin and not (self.cfg.get("clips") or {}).get("force"):
+            # many cameras give a single connection per stream ("453 Not Enough Bandwidth"): keep it for live video
+            log.info("clips off on this computer (set clips.force to record them)")
+            return
         if not shutil.which("ffmpeg"):
             log.error("clips are enabled but ffmpeg is missing (sudo apt install ffmpeg)")
             return
@@ -802,6 +819,19 @@ class Agent:
                 self.recorders[key] = r
                 r.start()
         log.info("recording %d camera(s) for clips (%gs before, %gs after the alarm)", len(self.recorders), self.clip_pre, self.clip_post)
+
+    def record_source(self, worker, key, channel):
+        """Where the clip recorder reads the camera: through go2rtc when it runs (one connection to the camera shared
+        with live view), otherwise straight from the camera."""
+        if self.g2r and self.g2r.bin:
+            if not self.g2r.ready():
+                return None
+            try:
+                return self.g2r.local_url(key)
+            except Exception as e:  # noqa: BLE001
+                log.info("[%s] recording through go2rtc: %s", key, e)
+                return None
+        return worker.rtsp(channel)
 
     def send_clip(self, key, t_alarm):
         time.sleep(self.clip_post + 2 * Recorder.SEGMENT + 1)  # the last segment must be fully written
@@ -1012,7 +1042,7 @@ class Agent:
             body = {"id": c["id"], "ok": True, "result": result}
             log.info("[%s] command %s ok", key, cmd)
         except Exception as e:  # noqa: BLE001
-            body = {"id": c["id"], "ok": False, "error": str(e)[:300]}
+            body = {"id": c["id"], "ok": False, "error": redact(e)[:300]}
             log.warning("[%s] command %s failed: %s", key, cmd, e)
         try:
             self.up.post("/api/edge/command", body, timeout=10)
@@ -1072,10 +1102,10 @@ class Agent:
             WebhookHub(self, int(self.cfg["local_webhook_port"])).start()
         for w in self.workers:
             w.start()
+        if self.g2r and not self.g2r.start():  # before the recorders, which read the cameras through it
+            log.info("go2rtc not found: live view sends about one picture per second")
         self._recorders()
         self._controls()
-        if self.g2r and not self.g2r.start():
-            log.info("go2rtc not found: live view sends about one picture per second")
         threading.Thread(target=self.frame_loop, daemon=True, name="frames").start()
         log.info("edge agent %s started with %d sources", VERSION, len(self.workers))
         self.control_loop()
@@ -1088,7 +1118,9 @@ def restart_windows():
     """Ends this agent's ffmpeg / go2rtc, starts a new agent (which waits for this one to exit) and exits."""
     ps = f"Get-CimInstance Win32_Process -Filter 'ParentProcessId={os.getpid()}' | ForEach-Object {{ taskkill /F /T /PID $_.ProcessId }}"
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, timeout=60, **NOWIN)
-    subprocess.Popen(RESTART_CMD, close_fds=True, cwd=APP_DIR, creationflags=0x00000008 | 0x00000200 | 0x08000000)
+    # PYINSTALLER_RESET_ENVIRONMENT: the new program must unpack itself afresh, not reuse this one's folder (deleted on exit)
+    subprocess.Popen(RESTART_CMD, close_fds=True, cwd=APP_DIR, creationflags=0x00000008 | 0x00000200 | 0x08000000,
+                     env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"})
     logging.shutdown()
     os._exit(0)
 
