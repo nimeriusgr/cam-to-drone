@@ -339,6 +339,7 @@ async function adminApi(request, env, p, url) {
     await db.prepare('DELETE FROM box WHERE id=?').bind(+m[1]).run();
     return j({ ok: true });
   }
+  if (p === '/ice') return j(await iceServers(env));
   m = p.match(/^\/cam\/(\d+)\/(live|frame|webrtc|diag)$/);
   if (!m) return j({ error: 'Δεν βρέθηκε' }, 404);
   const cam = await db.prepare('SELECT c.*, b.last_seen AS box_seen FROM bcam c JOIN box b ON b.id=c.box_id WHERE c.id=?').bind(+m[1]).first();
@@ -371,6 +372,23 @@ async function adminApi(request, env, p, url) {
   if (!q) return j({ error: 'Δεν βρέθηκε' }, 404);
   let r = null; try { r = JSON.parse(q.result || 'null'); } catch { }
   return j({ status: q.status, sdp: q.status === 'done' && r ? r.sdp : null, error: q.status === 'failed' && r ? r.error : null });
+}
+
+// ------------------------------------------------------------------ WebRTC relay (TURN)
+// When the box and the viewer cannot connect directly (strict company firewalls, mobile networks), the video goes
+// through Cloudflare's TURN relay. Secrets TURN_KEY_ID / TURN_KEY_TOKEN: Cloudflare dashboard → Realtime → TURN Server.
+// Without them the page uses STUN only, as before.
+const STUN = [{ urls: 'stun:stun.cloudflare.com:3478' }, { urls: 'stun:stun.l.google.com:19302' }];
+async function iceServers(env) {
+  if (!env.TURN_KEY_ID || !env.TURN_KEY_TOKEN) return { iceServers: STUN, relay: false };
+  try {
+    const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
+      method: 'POST', headers: { authorization: `Bearer ${env.TURN_KEY_TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ ttl: 4 * 3600 }), signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return { iceServers: STUN, relay: false, error: `TURN ${r.status}` };
+    const list = [].concat((await r.json()).iceServers || []).filter(Boolean);
+    return list.length ? { iceServers: list, relay: true } : { iceServers: STUN, relay: false };
+  } catch (e) { return { iceServers: STUN, relay: false, error: String(e.message || e) }; }
 }
 
 // ------------------------------------------------------------------ admin page
@@ -459,7 +477,8 @@ async function p2p(me,cam,v){v.innerHTML='<video autoplay muted playsinline></vi
  const video=v.querySelector('video'),msg=v.querySelector('.msg'),snd=v.querySelector('.snd');
  snd.onclick=()=>{video.muted=!video.muted;if(!video.muted)video.play().catch(()=>{});snd.textContent=video.muted?'🔇 Ήχος':'🔊 Ήχος'};
  video.onplaying=()=>{msg.hidden=true};
- const pc=me.pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}]});
+ let ice={iceServers:[{urls:'stun:stun.cloudflare.com:3478'}]};try{ice=await api('/ice')}catch{}
+ const pc=me.pc=new RTCPeerConnection({iceServers:ice.iceServers});
  pc.addTransceiver('video',{direction:'recvonly'});pc.addTransceiver('audio',{direction:'recvonly'});
  const ms=new MediaStream();video.srcObject=ms;pc.ontrack=e=>ms.addTrack(e.track);
  me.timer=setInterval(()=>api('/cam/'+cam+'/live',{}).catch(()=>{}),10000);

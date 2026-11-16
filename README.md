@@ -109,6 +109,13 @@ sudo systemctl start cam2drone-edge && journalctl -u cam2drone-edge -f
 
 **Ζωντανό βίντεο μέσω κουτιού (go2rtc), χωρίς media server:** όταν το κουτί έχει go2rtc (στα Windows ενσωματωμένο, σε Linux αρκεί το `go2rtc` στο PATH ή δίπλα στο `agent.py`), το «Ζωντανά» της κονσόλας ανοίγει σύνδεση WebRTC: η πρόταση του browser πηγαίνει στο κουτί ως εντολή κάμερας και η απάντηση επιστρέφει από τον ίδιο δρόμο, ενώ το βίντεο πάει απευθείας κουτί → browser (STUN), με καθυστέρηση κάτω από 1″. Χρησιμοποιείται το sub-stream της κάμερας. Αν η κάμερα στέλνει H.265, το ffmpeg το μετατρέπει σε H.264. Αν δεν γίνει απευθείας σύνδεση (π.χ. αυστηρό NAT), η κονσόλα γυρίζει σε ~1 καρέ/δευτ.
 
+**Relay (TURN) για αυστηρά δίκτυα:** σε εταιρικά firewall που αλλάζουν θύρα σε κάθε σύνδεση (συμμετρικό NAT) ή σε κινητά δίκτυα, η απευθείας σύνδεση αποτυγχάνει. Τότε το βίντεο περνά από τον TURN relay του Cloudflare. Ο server δίνει στον browser προσωρινά στοιχεία (4 ώρες) από `/api/<token>/admin/ice`· το κουτί δεν χρειάζεται αλλαγή. Ρύθμιση (μία φορά): Cloudflare → Realtime → TURN Server → Create, και μετά στον φάκελο `testpad/`:
+```
+npx wrangler pages secret put TURN_KEY_ID --project-name skywarden-test
+npx wrangler pages secret put TURN_KEY_TOKEN --project-name skywarden-test
+```
+Χωρίς αυτά η σελίδα δουλεύει όπως πριν (μόνο STUN). Κόστος: δωρεάν μέχρι 1.000 GB τον μήνα, μετά $0,05/GB· ένα κανάλι sub-stream είναι περίπου 0,5–1 GB ανά ώρα προβολής, και μόνο όσες προβολές δεν συνδέονται απευθείας περνούν από τον relay. Στο κανονικό SKYWARDEN (`cloudflare/`) δεν έχει μπει ακόμα.
+
 ## Κάμερες χωρίς κουτί (απευθείας webhook)
 Από Διαχείριση → Οργανισμοί, αντιγράψτε το «Webhook για κάμερες» της επιχείρησης.
 Για Hikvision: Configuration → Network → Advanced → **HTTP Listening** (IP/θύρα του server, URL `/webhook/<token>`), και στο event **Linkage → Notify Surveillance Center**.
