@@ -39,7 +39,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.5.6"
+VERSION = "1.5.8"
 log = logging.getLogger("edge")
 
 FROZEN = getattr(sys, "frozen", False)  # Windows build (PyInstaller): no self-update, tools bundled next to the program
@@ -67,6 +67,12 @@ RAW_MAP = {
     "peopledetect": "human", "humandetect": "human", "vehicledetect": "vehicle", "tampering": "tamper",
     "digitalinput": "input", "intrusion": "zone", "tripwire": "line",
 }
+
+
+def xml_leaves(text, limit=700):
+    """Compact view of a small XML answer: tag=value for every element that holds text."""
+    pairs = re.findall(r"<(?:\w+:)?(\w+)[^<>]*>([^<>]+)</", text)
+    return "; ".join(f"{k}={v.strip()}" for k, v in pairs if v.strip())[:limit]
 
 
 def redact(text):
@@ -1100,16 +1106,34 @@ class Agent:
                 out.append(f"go2rtc: {redact(e)[:200]}")
         else:
             out.append("go2rtc: not running")
+        if isinstance(w, HikvisionWorker):  # ask the camera itself who is connected and how its streams are set
+            ch = int(w.channel_of(key) or w.cam.get("channel", 1))
+            for label, path in (("device", "/ISAPI/System/deviceInfo"), ("video sessions now", "/ISAPI/Streaming/status"),
+                                ("users connected", "/ISAPI/Security/onlineUser"), (f"sub-stream settings", f"/ISAPI/Streaming/channels/{ch}02"),
+                                ("main stream settings", f"/ISAPI/Streaming/channels/{ch}01")):
+                try:
+                    with w.opener().open(w.base() + path, timeout=6) as r:
+                        body = r.read(200_000).decode("utf-8", "replace")
+                    if label == "device":
+                        got = {k: v for k, v in re.findall(r"<(model|firmwareVersion|deviceType)>([^<]*)<", body)}
+                        out.append("device: " + " · ".join(got.get(k, "") for k in ("model", "deviceType", "firmwareVersion") if got.get(k)))
+                    else:
+                        out.append(f"{label}: " + (xml_leaves(redact(body)) or "(empty)"))
+                except urllib.error.HTTPError as e:
+                    out.append(f"{label}: the camera answered {e.code}")
+                except Exception as e:  # noqa: BLE001
+                    out.append(f"{label}: {redact(e)[:120]}")
         ff = shutil.which("ffmpeg")
         if not url:
             out.append("camera: no RTSP address")
         elif not ff:
             out.append("camera: ffmpeg missing, cannot test")
         else:
-            for u in stream_alternatives(url):
-                label = redact(u).split("@")[-1]
+            alts = stream_alternatives(url)
+            for u, transport in [(u, "tcp") for u in alts] + [(alts[0], "udp")]:  # the sub-stream also over UDP
+                label = redact(u).split("@")[-1] + (" (UDP)" if transport == "udp" else "")
                 try:  # only opens the stream and reads what it carries; no output file, so ffmpeg ends at once
-                    p = subprocess.run([ff, "-hide_banner", "-rtsp_transport", "tcp", "-timeout", "8000000", "-i", u],
+                    p = subprocess.run([ff, "-hide_banner", "-rtsp_transport", transport, "-timeout", "8000000", "-i", u],
                                        capture_output=True, timeout=20, **NOWIN)
                     err = p.stderr.decode("utf-8", "replace")
                     streams = re.findall(r"Stream #\d+:\d+[^:]*: ((?:Video|Audio): [^\n\r]{0,80})", err)
@@ -1117,7 +1141,8 @@ class Agent:
                         out.append(f"{label}: OPENS · " + " · ".join(x.strip() for x in streams))
                     else:
                         lines = [x.strip() for x in err.splitlines() if x.strip() and "At least one output" not in x]
-                        out.append(f"{label}: REFUSED · " + redact(" | ".join(lines[-2:]))[:300])
+                        why = [re.sub(r"^\[[^\]]*\]\s*", "", x) for x in lines if "failed" in x.lower()][:1]  # e.g. method SETUP failed: 453
+                        out.append(f"{label}: REFUSED · " + redact(" | ".join(why or lines[-1:]))[:300])
                 except subprocess.TimeoutExpired:
                     out.append(f"{label}: no answer in 20 s")
                 except Exception as e:  # noqa: BLE001
