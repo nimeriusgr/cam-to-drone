@@ -1,6 +1,8 @@
 // SKYWARDEN · mini camera test.
 // A camera / NVR pushes its alarm to /hook/<TOKEN>; the page at /<TOKEN> shows it at once with sound.
 // Storage: D1 (binding DB), table created on first use. Secret: HOOK_TOKEN.
+// Box (edge agent / Cam2Drone-Setup.exe) support: the box talks to /api/edge/* with its own code; /<TOKEN>/admin lists the
+// boxes, their cameras and opens live video (WebRTC through the box's go2rtc, or about one picture per second).
 
 const KEEP = 300;               // events kept
 const MAX_IMG = 1_800_000;      // bytes per stored snapshot
@@ -21,6 +23,9 @@ export async function onRequest({ request, env }) {
   if (!T) return new Response('HOOK_TOKEN missing', { status: 500 });
   try {
     if (p === `/hook/${T}` || p.startsWith(`/hook/${T}/`)) return await hook(request, env);
+    if (p.startsWith('/api/edge/')) return await edgeApi(request, env, p);
+    if (p === `/${T}/admin`) return new Response(adminPage(T), { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
+    if (p.startsWith(`/api/${T}/admin/`)) return await adminApi(request, env, p.slice(`/api/${T}/admin`.length), url);
     if (p === `/${T}` || p === `/${T}/`) return new Response(page(T), { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
     if (p === `/api/${T}/events`) return await events(env, +url.searchParams.get('after') || 0);
     if (p === `/api/${T}/arm` && request.method === 'POST') return await setArm(request, env);
@@ -38,6 +43,9 @@ async function ensure(db) {
   await db.exec('CREATE TABLE IF NOT EXISTS ev (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, type TEXT, state TEXT, channel TEXT, cam TEXT, ip TEXT, target TEXT, raw TEXT, img BLOB, img_type TEXT)');
   try { await db.exec('ALTER TABLE ev ADD COLUMN armed INTEGER DEFAULT 1'); } catch { }
   await db.exec('CREATE TABLE IF NOT EXISTS arm (id INTEGER PRIMARY KEY, mode TEXT, sfrom TEXT, sto TEXT, by TEXT, ts INTEGER)');
+  await db.exec('CREATE TABLE IF NOT EXISTS box (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, token TEXT UNIQUE, last_seen INTEGER, version TEXT, host TEXT)');
+  await db.exec('CREATE TABLE IF NOT EXISTS bcam (id INTEGER PRIMARY KEY AUTOINCREMENT, box_id INTEGER, k TEXT, name TEXT, online INTEGER, caps TEXT, last_seen INTEGER, live_until INTEGER DEFAULT 0, frame BLOB, frame_type TEXT, frame_ts INTEGER, UNIQUE(box_id, k))');
+  await db.exec('CREATE TABLE IF NOT EXISTS bcmd (id INTEGER PRIMARY KEY AUTOINCREMENT, box_id INTEGER, cam_id INTEGER, cmd TEXT, args TEXT, status TEXT DEFAULT \'pending\', result TEXT, created INTEGER)');
   ready = true;
 }
 
@@ -52,7 +60,7 @@ async function armState(db) {
   return { mode: r.mode, from: r.sfrom || '20:00', to: r.sto || '07:00', by: r.by || '', changed: r.ts || null, armed };
 }
 async function setArm(request, env) {
-  const b = await request.json(), hm = v => /^d{2}:d{2}$/.test(v || '') ? v : null;
+  const b = await request.json(), hm = v => /^\d{2}:\d{2}$/.test(v || '') ? v : null;
   const mode = ['armed', 'disarmed', 'schedule'].includes(b.mode) ? b.mode : 'armed';
   const cur = await armState(env.DB);
   await env.DB.prepare('INSERT OR REPLACE INTO arm (id,mode,sfrom,sto,by,ts) VALUES (1,?,?,?,?,?)')
@@ -185,6 +193,7 @@ input,select{background:#0b1219;color:var(--tx);border:1px solid var(--line);bor
 </style></head><body>
 <header><div class="brand">SKYWARDEN<small>Τεστ κάμερας · Adesco</small></div>
 <div class="pill"><span class="dot" id="dot"></span><span id="contact">Αναμονή πρώτου σήματος από την κάμερα</span></div>
+<a class="pill" style="margin-left:0;text-decoration:none;color:var(--tx)" href="/${T}/admin">Κουτί &amp; ζωντανό βίντεο</a>
 <button id="enable">Ενεργοποίηση ήχου &amp; ειδοποιήσεων</button></header>
 <main>
 <section class="arm" id="arm"><div class="st"><div class="ic" id="armic">●</div><div><div class="big" id="armtxt">&nbsp;</div><div class="who" id="armwho"></div></div></div>
@@ -231,5 +240,213 @@ async function setArm(mode){const r=await fetch('/api/'+T+'/arm',{method:'POST',
 for(const b of document.querySelectorAll('.seg button'))b.onclick=()=>setArm(b.dataset.m);
 for(const i of [$('sfrom'),$('sto')]){i.onfocus=()=>editing=true;i.onblur=()=>editing=false;i.onchange=()=>{editing=false;setArm('schedule')};}
 poll();
+</script></body></html>`;
+}
+
+// ------------------------------------------------------------------ box (edge agent) API, same contract as the main SKYWARDEN server
+const LIVE_MS = 30_000, CMD_TTL = 60_000, ONLINE_MS = 120_000;
+const j = (o, status = 200) => Response.json(o, { status, headers: { 'cache-control': 'no-store' } });
+const code = () => { const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', r = crypto.getRandomValues(new Uint8Array(12)); let s = ''; for (let i = 0; i < 12; i++) s += (i && i % 4 === 0 ? '-' : '') + a[r[i] % a.length]; return s; };
+const b64bytes = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+async function edgeApi(request, env, p) {
+  const db = env.DB; await ensure(db);
+  const tok = (request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  const box = tok && await db.prepare('SELECT * FROM box WHERE token=?').bind(tok).first();
+  if (!box) return j({ error: 'Άγνωστος κωδικός κουτιού' }, 401);
+  const now = Date.now();
+  await db.prepare('UPDATE box SET last_seen=? WHERE id=?').bind(now, box.id).run();
+  const camOf = k => db.prepare('SELECT * FROM bcam WHERE box_id=? AND k=?').bind(box.id, k).first();
+  if (p === '/api/edge/frame') {
+    const cam = await camOf(request.headers.get('x-camera-key') || ''); if (!cam) return j({ error: 'Άγνωστη κάμερα' }, 404);
+    const data = new Uint8Array(await request.arrayBuffer()); if (!data.length || data.length > MAX_IMG) return j({ error: 'Εικόνα' }, 400);
+    await db.prepare('UPDATE bcam SET frame=?, frame_type=?, frame_ts=? WHERE id=?').bind(data, request.headers.get('content-type') || 'image/jpeg', now, cam.id).run();
+    return j({ ok: true });
+  }
+  if (p === '/api/edge/clip') return j({ error: 'Τα κλιπ δεν κρατιούνται στο τεστ' }, 501);
+  if (p === '/api/edge/agent') return j({ error: 'Δεν υπάρχει' }, 404);
+  const b = request.method === 'POST' ? await request.json().catch(() => ({})) : {};
+  if (p === '/api/edge/heartbeat') {
+    await db.prepare('UPDATE box SET version=?, host=? WHERE id=?').bind(String(b.version || ''), String(b.hostname || '').slice(0, 60), box.id).run();
+    for (const c of (b.cameras || []).slice(0, 200)) {
+      await db.prepare(`INSERT INTO bcam (box_id,k,name,online,caps,last_seen) VALUES (?,?,?,?,?,?)
+        ON CONFLICT(box_id,k) DO UPDATE SET name=excluded.name, online=excluded.online, caps=excluded.caps, last_seen=excluded.last_seen`)
+        .bind(box.id, String(c.key).slice(0, 80), String(c.name || c.key).slice(0, 80), c.online === false ? 0 : 1, JSON.stringify(c.caps || {}).slice(0, 8000), now).run();
+    }
+    return j(await edgePoll(db, box));
+  }
+  if (p === '/api/edge/poll') return j(await edgePoll(db, box));
+  if (p === '/api/edge/command') {
+    const q = await db.prepare('SELECT id FROM bcmd WHERE id=? AND box_id=?').bind(+b.id || 0, box.id).first(); if (!q) return j({ error: 'Άγνωστη εντολή' }, 404);
+    await db.prepare('UPDATE bcmd SET status=?, result=? WHERE id=?').bind(b.ok ? 'done' : 'failed', JSON.stringify(b.ok ? b.result ?? null : { error: String(b.error || 'αποτυχία').slice(0, 300) }).slice(0, 32000), q.id).run();
+    return j({ ok: true });
+  }
+  if (p === '/api/edge/event') {  // the box's alarms show on the test page like the camera's own
+    const arm = await armState(db), cam = await camOf(String(b.camera_key || ''));
+    const img = b.image_b64 ? b64bytes(b.image_b64) : null;
+    await db.prepare('INSERT INTO ev (ts,type,state,channel,cam,ip,target,raw,img,img_type,armed) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+      .bind(b.ts ? Math.round(b.ts * 1000) : now, String(b.raw_type || b.type || ''), b.state === 'inactive' ? 'inactive' : 'active', '', String(b.camera_name || cam?.name || b.camera_key || ''),
+        `κουτί: ${box.name}`, String(b.target || ''), String(b.raw || '').slice(0, 4000), img && img.length <= MAX_IMG ? img : null,
+        img ? (b.image_ext === 'png' ? 'image/png' : 'image/jpeg') : null, arm.armed ? 1 : 0).run();
+    await db.prepare('DELETE FROM ev WHERE id <= (SELECT MAX(id) FROM ev) - ?').bind(KEEP).run();
+    return j({ ok: true });
+  }
+  return j({ error: 'Δεν βρέθηκε' }, 404);
+}
+
+async function edgePoll(db, box) {
+  const now = Date.now();
+  await db.prepare("UPDATE bcmd SET status='expired' WHERE status='pending' AND created<?").bind(now - CMD_TTL).run();
+  const { results: live } = await db.prepare('SELECT k FROM bcam WHERE box_id=? AND live_until>?').bind(box.id, now).run();
+  const { results: cmds } = await db.prepare("SELECT q.id, q.cmd, q.args, c.k FROM bcmd q JOIN bcam c ON c.id=q.cam_id WHERE q.box_id=? AND q.status='pending' ORDER BY q.id LIMIT 20").bind(box.id).run();
+  for (const c of cmds) await db.prepare("UPDATE bcmd SET status='sent' WHERE id=?").bind(c.id).run();
+  const recent = await db.prepare('SELECT 1 AS x FROM bcmd WHERE box_id=? AND created>? LIMIT 1').bind(box.id, now - 90_000).first();
+  return { ok: true, server_time: now / 1000, fast: !!(live.length || cmds.length || recent), live: live.map(r => r.k), streams: {},
+    commands: cmds.map(c => ({ id: c.id, cmd: c.cmd, args: JSON.parse(c.args || '{}'), camera_key: c.k })), update: false, agent: {} };
+}
+
+// ------------------------------------------------------------------ admin API (behind the same secret address as the page)
+async function adminApi(request, env, p, url) {
+  const db = env.DB; await ensure(db);
+  const now = Date.now(), post = request.method === 'POST';
+  if (p === '/boxes' && !post) {
+    const { results: boxes } = await db.prepare('SELECT id,name,token,last_seen,version,host FROM box ORDER BY id').run();
+    const { results: cams } = await db.prepare('SELECT id,box_id,k,name,online,caps,last_seen,frame_ts FROM bcam ORDER BY name').run();
+    for (const b of boxes) {
+      b.online = !!(b.last_seen && now - b.last_seen < ONLINE_MS);
+      b.cameras = cams.filter(c => c.box_id === b.id).map(c => ({ id: c.id, name: c.name, key: c.k, online: !!c.online && b.online, webrtc: !!JSON.parse(c.caps || '{}').webrtc }));
+    }
+    return j({ boxes, now, server: url.origin });
+  }
+  if (p === '/boxes' && post) {
+    const b = await request.json().catch(() => ({})), name = String(b.name || '').trim().slice(0, 60) || 'Κουτί';
+    await db.prepare('INSERT INTO box (name, token) VALUES (?,?)').bind(name, code()).run();
+    return j({ ok: true });
+  }
+  let m = p.match(/^\/boxes\/(\d+)\/delete$/);
+  if (m && post) {
+    await db.prepare('DELETE FROM bcmd WHERE box_id=?').bind(+m[1]).run();
+    await db.prepare('DELETE FROM bcam WHERE box_id=?').bind(+m[1]).run();
+    await db.prepare('DELETE FROM box WHERE id=?').bind(+m[1]).run();
+    return j({ ok: true });
+  }
+  m = p.match(/^\/cam\/(\d+)\/(live|frame|webrtc)$/);
+  if (!m) return j({ error: 'Δεν βρέθηκε' }, 404);
+  const cam = await db.prepare('SELECT c.*, b.last_seen AS box_seen FROM bcam c JOIN box b ON b.id=c.box_id WHERE c.id=?').bind(+m[1]).first();
+  if (!cam) return j({ error: 'Δεν βρέθηκε' }, 404);
+  const boxOnline = !!(cam.box_seen && now - cam.box_seen < ONLINE_MS), webrtc = !!JSON.parse(cam.caps || '{}').webrtc;
+  if (m[2] === 'frame') {
+    if (!cam.frame) return j({ error: 'Δεν υπάρχει ακόμα εικόνα' }, 404);
+    return new Response(new Uint8Array(cam.frame), { headers: { 'content-type': cam.frame_type || 'image/jpeg', 'cache-control': 'no-store' } });
+  }
+  await db.prepare('UPDATE bcam SET live_until=? WHERE id=?').bind(now + LIVE_MS, cam.id).run(); // the box polls fast and sends pictures
+  if (m[2] === 'live') return j({ ok: true, box_online: boxOnline, p2p: boxOnline && webrtc, frame_ts: cam.frame_ts || null });
+  if (post) {
+    const b = await request.json().catch(() => ({})), sdp = String(b.sdp || '');
+    if (!webrtc) return j({ error: 'Το κουτί δεν έχει ζωντανό βίντεο' }, 409);
+    if (!sdp.startsWith('v=0') || sdp.length > 20000) return j({ error: 'Άκυρο αίτημα βίντεο' }, 400);
+    const r = await db.prepare('INSERT INTO bcmd (box_id,cam_id,cmd,args,created) VALUES (?,?,?,?,?)').bind(cam.box_id, cam.id, 'webrtc', JSON.stringify({ sdp }), now).run();
+    return j({ ok: true, id: r.meta.last_row_id });
+  }
+  const q = await db.prepare("SELECT status, result FROM bcmd WHERE id=? AND cam_id=? AND cmd='webrtc'").bind(+url.searchParams.get('id') || 0, cam.id).first();
+  if (!q) return j({ error: 'Δεν βρέθηκε' }, 404);
+  let r = null; try { r = JSON.parse(q.result || 'null'); } catch { }
+  return j({ status: q.status, sdp: q.status === 'done' && r ? r.sdp : null, error: q.status === 'failed' && r ? r.error : null });
+}
+
+// ------------------------------------------------------------------ admin page
+function adminPage(T) {
+  return `<!doctype html><html lang="el"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SKYWARDEN · Κουτί</title>
+<style>
+:root{--bg:#0a0f15;--panel:#111821;--line:#1f2a36;--tx:#e6edf3;--mut:#8b9bb0;--acc:#38bdf8;--red:#ef4444;--ok:#22c55e}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.45 "Segoe UI",system-ui,sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.brand{font-weight:800;letter-spacing:.22em;font-size:18px}.brand small{font-weight:500;letter-spacing:.05em;color:var(--mut);font-size:13px;margin-left:8px}
+a{color:var(--acc)}header a{margin-left:auto;font-size:14px}
+button{background:var(--acc);color:#04121c;border:0;border-radius:8px;padding:9px 14px;font-weight:700;cursor:pointer;font-size:14px}
+button.ghost{background:transparent;color:var(--tx);border:1px solid var(--line)}button.sm{padding:6px 10px;font-size:13px}button:disabled{opacity:.5;cursor:default}
+main{max-width:1100px;margin:0 auto;padding:20px;display:grid;gap:18px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+h3{margin:0 0 10px;font-size:13px;letter-spacing:.12em;color:var(--mut);font-weight:700}
+.hint{color:var(--mut);font-size:13px;margin:0}
+input{background:#0b1219;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:9px 10px;font:inherit;font-size:16px;min-width:0}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+code{background:#0b1219;border:1px solid var(--line);padding:3px 8px;border-radius:6px;font-size:15px;letter-spacing:.06em}
+.box{border-top:1px solid var(--line);padding:14px 0}.box:first-of-type{border-top:0}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--mut);margin-right:6px}.dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.cams{display:grid;gap:8px;margin-top:10px}.cam{display:flex;align-items:center;gap:10px;background:#0b1219;border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+.cam .n{flex:1;min-width:0}.cam small{color:var(--mut)}
+.viewer{position:relative;background:#000;aspect-ratio:16/9;border-radius:12px;overflow:hidden;display:grid;place-items:center;color:var(--mut)}
+.viewer video,.viewer img{width:100%;height:100%;object-fit:contain;position:absolute;inset:0}
+.viewer .msg{position:relative;z-index:1;padding:20px;text-align:center}
+.viewer .tag{position:absolute;top:10px;left:10px;z-index:2;background:var(--red);color:#fff;font-weight:800;font-size:12px;padding:3px 8px;border-radius:5px}
+.viewer .snd{position:absolute;bottom:10px;right:10px;z-index:2}
+[hidden]{display:none!important}
+</style></head><body>
+<header><div class="brand">SKYWARDEN<small>Κουτί &amp; ζωντανό βίντεο · τεστ</small></div><a href="/${T}">← Σήματα καμερών</a></header>
+<main>
+<section class="card" id="vcard" hidden><div class="row" style="margin-bottom:10px"><h3 style="margin:0" id="vtitle">ΖΩΝΤΑΝΑ</h3><button class="ghost sm" id="vstop" style="margin-left:auto">Κλείσιμο</button></div>
+<div class="viewer" id="viewer"></div></section>
+<section class="card"><h3>ΚΟΥΤΙΑ</h3>
+<p class="hint">Στο <b>Cam2Drone-Setup.exe</b> βάλτε «Κέντρο»: <code id="srv"></code> και «Κωδικός κουτιού»: τον κωδικό του κουτιού από εδώ.</p>
+<div id="boxes"><p class="hint" style="margin-top:12px">Φόρτωση…</p></div>
+<div class="row" style="margin-top:12px"><input id="bname" placeholder="Όνομα, π.χ. Γραφείο Adesco" style="flex:1"><button id="badd">Νέο κουτί</button></div></section>
+</main>
+<script>
+const T=${JSON.stringify(T)},A='/api/'+T+'/admin';
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const api=async(p,body)=>{const r=await fetch(A+p,body!==undefined?{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Σφάλμα '+r.status);return d;};
+const ago=t=>{if(!t)return 'ποτέ';const s=Math.round((Date.now()-t)/1000);return s<60?s+'″ πριν':s<3600?Math.round(s/60)+'′ πριν':new Date(t).toLocaleString('el-GR',{hour12:false})};
+let live=null;
+async function load(){try{const d=await api('/boxes');$('srv').textContent=d.server;
+ $('boxes').innerHTML=d.boxes.length?d.boxes.map(b=>'<div class="box"><div class="row"><b><span class="dot'+(b.online?' on':'')+'"></span>'+esc(b.name)+'</b>'+
+ '<code>'+esc(b.token)+'</code><button class="ghost sm" data-copy="'+esc(b.token)+'">Αντιγραφή</button>'+
+ '<span class="hint">'+(b.online?'Συνδεδεμένο':'Τελευταία επαφή: '+ago(b.last_seen))+(b.version?' · έκδοση '+esc(b.version):'')+(b.host?' · '+esc(b.host):'')+'</span>'+
+ '<button class="ghost sm" data-del="'+b.id+'" style="margin-left:auto">Διαγραφή</button></div>'+
+ '<div class="cams">'+(b.cameras.length?b.cameras.map(c=>'<div class="cam"><span class="dot'+(c.online?' on':'')+'"></span><div class="n">'+esc(c.name)+'<br><small>'+(c.webrtc?'Ζωντανό βίντεο':'Εικόνα ανά δευτερόλεπτο')+'</small></div>'+
+  '<button class="sm" data-live="'+c.id+'" data-name="'+esc(c.name)+'"'+(b.online?'':' disabled')+'>Ζωντανά</button></div>').join(''):'<p class="hint">Δεν έχουν δηλωθεί κάμερες ακόμα. Εγκαταστήστε το κουτί με αυτόν τον κωδικό.</p>')+'</div></div>').join('')
+ :'<p class="hint" style="margin-top:12px">Δεν υπάρχει κουτί. Δώστε ένα όνομα και πατήστε «Νέο κουτί».</p>';
+ for(const x of document.querySelectorAll('[data-copy]'))x.onclick=async()=>{try{await navigator.clipboard.writeText(x.dataset.copy);x.textContent='Αντιγράφηκε ✓'}catch{}};
+ for(const x of document.querySelectorAll('[data-del]'))x.onclick=async()=>{if(confirm('Διαγραφή κουτιού; Το κουτί δεν θα μπορεί πια να συνδεθεί.')){await api('/boxes/'+x.dataset.del+'/delete',{});load()}};
+ for(const x of document.querySelectorAll('[data-live]'))x.onclick=()=>startLive(+x.dataset.live,x.dataset.name);
+ }catch(e){$('boxes').innerHTML='<p class="hint">'+esc(e.message)+'</p>'}}
+$('badd').onclick=async()=>{await api('/boxes',{name:$('bname').value});$('bname').value='';load()};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function stopLive(){if(live){live.dead=true;clearInterval(live.timer);if(live.pc)live.pc.close();live=null}$('viewer').innerHTML='';$('vcard').hidden=true}
+$('vstop').onclick=stopLive;
+async function startLive(cam,name){stopLive();const me=live={cam};$('vcard').hidden=false;$('vtitle').textContent='ΖΩΝΤΑΝΑ · '+name.toUpperCase();
+ const v=$('viewer');v.innerHTML='<div class="msg">Σύνδεση με την κάμερα μέσω του κουτιού…</div>';scrollTo({top:0,behavior:'smooth'});
+ let st;try{st=await api('/cam/'+cam+'/live',{})}catch(e){v.innerHTML='<div class="msg">'+esc(e.message)+'</div>';return}
+ if(me.dead)return;if(!st.box_online){v.innerHTML='<div class="msg">Το κουτί δεν είναι συνδεδεμένο.</div>';return}
+ if(st.p2p&&'RTCPeerConnection'in window){try{await p2p(me,cam,v);return}catch(e){if(me.dead)return;v.innerHTML='<div class="msg">'+esc(e.message)+'. Εμφάνιση εικόνας ανά δευτερόλεπτο…</div>';await sleep(1500)}}
+ if(!me.dead)frames(me,cam,v)}
+async function p2p(me,cam,v){v.innerHTML='<video autoplay muted playsinline></video><div class="msg">Σύνδεση με την κάμερα μέσω του κουτιού…</div><span class="tag">LIVE</span><button class="ghost sm snd">🔇 Ήχος</button>';
+ const video=v.querySelector('video'),msg=v.querySelector('.msg'),snd=v.querySelector('.snd');
+ snd.onclick=()=>{video.muted=!video.muted;if(!video.muted)video.play().catch(()=>{});snd.textContent=video.muted?'🔇 Ήχος':'🔊 Ήχος'};
+ video.onplaying=()=>{msg.hidden=true};
+ const pc=me.pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}]});
+ pc.addTransceiver('video',{direction:'recvonly'});pc.addTransceiver('audio',{direction:'recvonly'});
+ const ms=new MediaStream();video.srcObject=ms;pc.ontrack=e=>ms.addTrack(e.track);
+ me.timer=setInterval(()=>api('/cam/'+cam+'/live',{}).catch(()=>{}),10000);
+ try{await pc.setLocalDescription(await pc.createOffer());
+  await new Promise(r=>{if(pc.iceGatheringState==='complete')return r();const t=setTimeout(r,2500);pc.onicegatheringstatechange=()=>{if(pc.iceGatheringState==='complete'){clearTimeout(t);r()}}});
+  const {id}=await api('/cam/'+cam+'/webrtc',{sdp:pc.localDescription.sdp});
+  for(let k=0;k<40;k++){await sleep(k<3?1500:1000);if(me.dead)return;
+   const r=await api('/cam/'+cam+'/webrtc?id='+id);
+   if(r.status==='failed'||r.status==='expired')throw new Error(r.error?'Το κουτί: '+r.error:'Το κουτί δεν απάντησε');
+   if(r.status!=='done'||!r.sdp)continue;
+   await pc.setRemoteDescription({type:'answer',sdp:r.sdp});
+   await new Promise((ok,bad)=>{const t=setTimeout(()=>bad(new Error('Δεν έγινε απευθείας σύνδεση με το κουτί')),15000);
+    const chk=()=>{if(pc.connectionState==='connected'){clearTimeout(t);ok()}else if(pc.connectionState==='failed'){clearTimeout(t);bad(new Error('Δεν έγινε απευθείας σύνδεση με το κουτί'))}};pc.onconnectionstatechange=chk;chk()});
+   return}
+  throw new Error('Το κουτί δεν απάντησε')}catch(e){clearInterval(me.timer);pc.close();me.pc=null;throw e}}
+function frames(me,cam,v){v.innerHTML='<img alt="" hidden><div class="msg">Αναμονή εικόνας από το κουτί…</div><span class="tag">LIVE · ~1 καρέ/δευτ.</span>';
+ const img=v.querySelector('img'),msg=v.querySelector('.msg');let n=0;
+ me.timer=setInterval(()=>{if(live!==me||document.hidden)return;n++;if(n%5===1)api('/cam/'+cam+'/live',{}).catch(()=>{});
+  const pr=new Image();pr.onload=()=>{if(live!==me)return;img.src=pr.src;img.hidden=false;msg.hidden=true};
+  pr.onerror=()=>{if(n>12&&img.hidden)msg.textContent='Δεν έρχεται εικόνα. Ελέγξτε ότι το κουτί βλέπει την κάμερα.'};
+  pr.src=A+'/cam/'+cam+'/frame?t='+Date.now()},1000)}
+load();setInterval(()=>{if(!document.hidden)load()},10000);
 </script></body></html>`;
 }
