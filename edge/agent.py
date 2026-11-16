@@ -39,7 +39,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 log = logging.getLogger("edge")
 
 FROZEN = getattr(sys, "frozen", False)  # Windows build (PyInstaller): no self-update, tools bundled next to the program
@@ -621,7 +621,7 @@ class Go2rtc:
         if not self.bin:
             return False
         os.makedirs(self.dir, exist_ok=True)
-        cfg = {"api": {"listen": self.API.split("//")[1]}, "rtsp": {"listen": ""}, "srtp": {"listen": ""},
+        cfg = {"api": {"listen": self.API.split("//")[1]}, "rtsp": {"listen": "127.0.0.1:8554"}, "srtp": {"listen": ""},  # local only: the ffmpeg sources publish through it
                "webrtc": {"listen": ":8555", "candidates": ["stun:8555"],
                           "ice_servers": [{"urls": ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"]}]},
                "ffmpeg": {"bin": shutil.which("ffmpeg") or "ffmpeg"}, "log": {"level": "warn"}}
@@ -647,8 +647,12 @@ class Go2rtc:
 
     def _req(self, method, path, data=None, ctype=None, timeout=10):
         req = urllib.request.Request(self.API + path, data=data, method=method, headers={"Content-Type": ctype} if ctype else {})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:  # go2rtc says why (camera refused, codec...): pass it on to the console
+            why = e.read()[:300].decode("utf-8", "replace").strip()
+            raise RuntimeError(f"go2rtc {e.code} {path.split('?')[0]}: {why or e.reason}") from None
 
     def ensure(self, key):
         w = self.agent.by_key(key)
@@ -658,7 +662,8 @@ class Go2rtc:
         n = self.name(key)
         with self.lock:
             if self.added.get(n) != url:
-                q = "name=" + quote(n, safe="") + "&src=" + quote(url, safe="")
+                # no two-way audio request: many Hikvision cameras refuse it ("wrong response on SETUP")
+                q = "name=" + quote(n, safe="") + "&src=" + quote(url + "#backchannel=0", safe="")
                 if shutil.which("ffmpeg"):
                     q += "&src=" + quote(f"ffmpeg:{n}#audio=opus", safe="")  # camera sound (G.711/AAC) -> Opus for the browser
                     q += "&src=" + quote(f"ffmpeg:{n}#video=h264", safe="")  # used only if the camera sends H.265, which browsers cannot play
