@@ -12,7 +12,7 @@ const TYPES = {
   regionentrance: 'Είσοδος σε περιοχή', regionexiting: 'Έξοδος από περιοχή', loitering: 'Περιφερόμενο άτομο',
   io: 'Είσοδος συναγερμού', alarmlocal: 'Είσοδος συναγερμού', alarminput: 'Είσοδος συναγερμού',
   tamperdetection: 'Παρέμβαση στην κάμερα', shelteralarm: 'Κάλυψη κάμερας', videoblind: 'Κάλυψη κάμερας',
-  videoloss: 'Απώλεια εικόνας', scenechangedetection: 'Αλλαγή σκηνής', facedetection: 'Ανίχνευση προσώπου',
+  videoloss: 'Απώλεια εικόνας', ping: 'Επαφή χωρίς δεδομένα συναγερμού', scenechangedetection: 'Αλλαγή σκηνής', facedetection: 'Ανίχνευση προσώπου',
 };
 const typeLabel = t => TYPES[String(t || '').toLowerCase().replace(/[^a-z]/g, '')] || (t ? String(t) : 'Συναγερμός');
 
@@ -67,6 +67,8 @@ async function hook(request, env) {
   const url = new URL(request.url);
   let { summary, images, raw } = parseBody(ctype, buf);
   if (!Object.keys(summary).length && url.search) summary = summarizeJson(Object.fromEntries(url.searchParams)); // GET ?event=... style
+  const empty = !Object.keys(summary).length && !images.length; // link previews, browser visits, connection tests
+  if (empty) summary = { eventType: 'ping', eventState: 'inactive' };
   const st = String(summary.eventState || 'active').toLowerCase();
   const state = /inactive|stop|end|false|0/.test(st) ? 'inactive' : 'active';
   const img = images.find(i => i[0].length <= MAX_IMG);
@@ -74,7 +76,8 @@ async function hook(request, env) {
   await env.DB.prepare('INSERT INTO ev (ts,type,state,channel,cam,ip,target,raw,img,img_type,armed) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
     .bind(Date.now(), String(summary.eventType || ''), state, String(summary.channelID || summary.dynChannelID || ''),
       String(summary.channelName || ''), ip, String(summary.targetType || summary.detectionTarget || ''),
-      (raw || `${request.method} ${url.pathname}${url.search}`).slice(0, 4000), img ? img[0] : null, img ? (img[1] === 'png' ? 'image/png' : 'image/jpeg') : null, arm.armed ? 1 : 0).run();
+      (raw || `${request.method} ${url.pathname}${url.search}
+User-Agent: ${request.headers.get('user-agent') || '—'}`).slice(0, 4000), img ? img[0] : null, img ? (img[1] === 'png' ? 'image/png' : 'image/jpeg') : null, arm.armed ? 1 : 0).run();
   await env.DB.prepare('DELETE FROM ev WHERE id <= (SELECT MAX(id) FROM ev) - ?').bind(KEEP).run();
   return new Response('OK', { headers: { 'content-type': 'text/plain' } });
 }
