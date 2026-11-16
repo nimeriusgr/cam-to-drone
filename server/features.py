@@ -476,6 +476,30 @@ def media_url(tpl, path):
     return (tpl or "").replace("{path}", path)
 
 
+# ------------------------------------------------------------------ WebRTC relay (TURN)
+# Short-lived Cloudflare TURN credentials (4 h) for networks that block a direct connection.
+# Env TURN_KEY_ID / TURN_KEY_TOKEN; without them STUN only (direct connection or ~1 frame/s).
+STUN = [{"urls": "stun:stun.cloudflare.com:3478"}, {"urls": "stun:stun.l.google.com:19302"}]
+
+
+def ice_servers():
+    kid, tok = os.environ.get("TURN_KEY_ID"), os.environ.get("TURN_KEY_TOKEN")
+    if not kid or not tok:
+        return {"iceServers": STUN, "relay": False}
+    try:
+        req = urllib.request.Request(
+            f"https://rtc.live.cloudflare.com/v1/turn/keys/{kid}/credentials/generate-ice-servers",
+            data=json.dumps({"ttl": 4 * 3600}).encode(), method="POST",
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            got = json.loads(r.read().decode())
+        lst = got.get("iceServers") or []
+        lst = [lst] if isinstance(lst, dict) else [x for x in lst if x]
+        return {"iceServers": lst, "relay": True} if lst else {"iceServers": STUN, "relay": False}
+    except Exception as e:  # network, auth or certificate problems: fall back to STUN
+        return {"iceServers": STUN, "relay": False, "error": str(e)[:200]}
+
+
 def media_play(kind, ident):
     m = media_cfg()
     return media_url(m["play"], media_path(kind, ident)) if m.get("play") and m.get("publish") else None

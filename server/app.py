@@ -718,6 +718,11 @@ class Handler(BaseHTTPRequestHandler):
             need(q, 404, "Δεν βρέθηκε")
             return self.send(200, q)
 
+        # ICE servers for live video: Cloudflare TURN relay (env TURN_KEY_ID / TURN_KEY_TOKEN) for networks that block a direct connection
+        if path == "/api/ice":
+            self.user()
+            return self.send(200, features.ice_servers())
+
         # real-time video through the box (go2rtc): the browser's WebRTC offer goes to the box as a command, the answer comes back
         m = re.fullmatch(r"/api/cameras/(\d+)/webrtc", path)
         if m:

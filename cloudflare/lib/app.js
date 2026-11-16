@@ -1087,6 +1087,8 @@ class App {
       return json({ ok: true, id: await this.queueCommand(cam, u, b.cmd, b.args || {}) });
     }
     if ((m = p.match(/^\/api\/commands\/(\d+)$/))) { await this.user(true, STAFF); const q = await this.commandView(+m[1]); need(q, 404, 'Δεν βρέθηκε'); return json(q); }
+    // ICE servers for live video: Cloudflare TURN relay (secrets TURN_KEY_ID / TURN_KEY_TOKEN) for networks that block a direct connection
+    if (p === '/api/ice') { await this.user(); return json(await iceServers(this.env)); }
     // real-time video through the box (go2rtc): the browser's WebRTC offer goes to the box as a command, the answer comes back the same way
     if ((m = p.match(/^\/api\/cameras\/(\d+)\/webrtc$/))) {
       const u = await this.user(), vis = await this.visible(u);
@@ -1259,6 +1261,21 @@ class App {
     }
     throw new ApiError(405, 'Μη επιτρεπτή μέθοδος');
   }
+}
+
+// ------------------------------------------------------------------ WebRTC relay (TURN)
+// Short-lived Cloudflare TURN credentials (4 h). Without the secrets, STUN only: direct connection or ~1 frame/s.
+const STUN = [{ urls: 'stun:stun.cloudflare.com:3478' }, { urls: 'stun:stun.l.google.com:19302' }];
+async function iceServers(env) {
+  if (!env.TURN_KEY_ID || !env.TURN_KEY_TOKEN) return { iceServers: STUN, relay: false };
+  try {
+    const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
+      method: 'POST', headers: { authorization: `Bearer ${env.TURN_KEY_TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ ttl: 4 * 3600 }), signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return { iceServers: STUN, relay: false, error: `TURN ${r.status}` };
+    const list = [].concat((await r.json()).iceServers || []).filter(Boolean);
+    return list.length ? { iceServers: list, relay: true } : { iceServers: STUN, relay: false };
+  } catch (e) { return { iceServers: STUN, relay: false, error: String(e.message || e) }; }
 }
 
 // ------------------------------------------------------------------ camera payload parsing

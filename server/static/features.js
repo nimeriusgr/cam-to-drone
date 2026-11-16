@@ -60,8 +60,15 @@
   }
 
   /* ================================================================ WebRTC playback (WHEP) from the media server: video + sound, about 1 s delay */
+  // ICE servers from the server: Cloudflare TURN relay when configured (credentials last 4 h, cached for 1 h), else STUN
+  let iceCache = null;
+  F.ice = async () => {
+    if (iceCache && Date.now() - iceCache.t < 3600e3) return iceCache.list;
+    try { const d = await api('/api/ice'); iceCache = { t: Date.now(), list: d.iceServers }; return d.iceServers; }
+    catch { return [{ urls: 'stun:stun.cloudflare.com:3478' }, { urls: 'stun:stun.l.google.com:19302' }]; }
+  };
   F.whep = async (url, video) => {
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
+    const pc = new RTCPeerConnection({ iceServers: await F.ice() });
     pc.addTransceiver('video', { direction: 'recvonly' }); pc.addTransceiver('audio', { direction: 'recvonly' });
     const ms = new MediaStream(); video.srcObject = ms; pc.ontrack = e => ms.addTrack(e.track);
     await pc.setLocalDescription(await pc.createOffer());
@@ -96,7 +103,7 @@
      the video itself goes peer to peer. Falls back to ~1 frame/s when the direct connection cannot be made. */
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   F.p2p = async (cam, video, dead) => {
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }, { urls: 'stun:stun.l.google.com:19302' }] });
+    const pc = new RTCPeerConnection({ iceServers: await F.ice() });
     pc.addTransceiver('video', { direction: 'recvonly' }); pc.addTransceiver('audio', { direction: 'recvonly' });
     const ms = new MediaStream(); video.srcObject = ms; pc.ontrack = e => ms.addTrack(e.track);
     try {
