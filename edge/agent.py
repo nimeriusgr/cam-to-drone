@@ -39,7 +39,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 log = logging.getLogger("edge")
 
 FROZEN = getattr(sys, "frozen", False)  # Windows build (PyInstaller): no self-update, tools bundled next to the program
@@ -625,6 +625,8 @@ class Go2rtc:
                "webrtc": {"listen": ":8555", "candidates": ["stun:8555"],
                           "ice_servers": [{"urls": ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"]}]},
                "ffmpeg": {"bin": shutil.which("ffmpeg") or "ffmpeg"}, "log": {"level": "warn"}}
+        if os.name == "nt":  # a go2rtc left over from an earlier run would keep the port with its old settings
+            subprocess.run(["taskkill", "/F", "/IM", os.path.basename(self.bin)], capture_output=True, **NOWIN)
         path = os.path.join(self.dir, "go2rtc.yaml")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=1)  # JSON is valid YAML
@@ -662,11 +664,13 @@ class Go2rtc:
         n = self.name(key)
         with self.lock:
             if self.added.get(n) != url:
-                # no two-way audio request: many Hikvision cameras refuse it ("wrong response on SETUP")
-                q = "name=" + quote(n, safe="") + "&src=" + quote(url + "#backchannel=0", safe="")
                 if shutil.which("ffmpeg"):
-                    q += "&src=" + quote(f"ffmpeg:{n}#audio=opus", safe="")  # camera sound (G.711/AAC) -> Opus for the browser
-                    q += "&src=" + quote(f"ffmpeg:{n}#video=h264", safe="")  # used only if the camera sends H.265, which browsers cannot play
+                    # ffmpeg reads the camera (the same way the clips do, which works with cameras go2rtc's own RTSP client
+                    # cannot handle): video as is, sound to Opus; the second source is used only for H.265 cameras
+                    srcs = [f"ffmpeg:{url}#video=copy#audio=opus", f"ffmpeg:{url}#video=h264#audio=opus"]
+                else:
+                    srcs = [url + "#backchannel=0"]  # no two-way audio request: many cameras refuse it
+                q = "name=" + quote(n, safe="") + "".join("&src=" + quote(x, safe="") for x in srcs)
                 self._req("PUT", "/api/streams?" + q)
                 self.added[n] = url
         return n
